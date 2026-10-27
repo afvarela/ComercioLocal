@@ -4,8 +4,6 @@
 -- contabilidad y configuraciones operativas. Al terminar se restauran los
 -- catalogos minimos del sistema.
 
-PRAGMA foreign_keys = OFF;
-BEGIN TRANSACTION;
 
 DELETE FROM dispatch_history;
 DELETE FROM dispatch_lines;
@@ -83,5 +81,3 @@ INSERT INTO dairy_products(id,code,name,unit,price,active) VALUES
 
 INSERT INTO label_settings(business_id) SELECT id FROM businesses;
 
-COMMIT;
-PRAGMA foreign_keys = ON;

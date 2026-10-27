@@ -11,9 +11,11 @@ class ResetScriptsTest(unittest.TestCase):
         for migration in sorted((ROOT / "cloudflare" / "migrations").glob("*.sql")):
             database.executescript(migration.read_text(encoding="utf-8"))
 
-        database.executescript(
-            (ROOT / "cloudflare" / "reset-test-data.sql").read_text(encoding="utf-8")
-        )
+        reset_sql = (ROOT / "cloudflare" / "reset-test-data.sql").read_text(encoding="utf-8")
+        incompatible = ("BEGIN TRANSACTION", "SAVEPOINT", "PRAGMA foreign_keys")
+        for statement in incompatible:
+            self.assertNotIn(statement, reset_sql)
+        database.executescript(reset_sql)
         database.executescript(
             (ROOT / "cloudflare" / "migrations" / "0005_vegetable_catalog.sql").read_text(
                 encoding="utf-8"
