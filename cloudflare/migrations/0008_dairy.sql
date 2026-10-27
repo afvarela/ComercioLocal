@@ -1,0 +1,10 @@
+ALTER TABLE sales ADD COLUMN dairy_total INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS dairy_products(id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,unit TEXT NOT NULL,price INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1);
+INSERT OR IGNORE INTO dairy_products(id,code,name,unit) VALUES(1,'LECHE','Leche de ordeño','litro'),(2,'QUESO','Queso campesino','libra');
+CREATE TABLE IF NOT EXISTS dairy_permissions(user_id INTEGER PRIMARY KEY,can_view INTEGER NOT NULL DEFAULT 0,can_price INTEGER NOT NULL DEFAULT 0,can_void INTEGER NOT NULL DEFAULT 0,can_close INTEGER NOT NULL DEFAULT 0,can_reopen INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO dairy_permissions(user_id,can_view,can_price,can_void,can_close,can_reopen) SELECT id,1,1,1,1,1 FROM users WHERE role='admin';
+CREATE TABLE IF NOT EXISTS dairy_sale_lines(id INTEGER PRIMARY KEY,sale_id INTEGER NOT NULL,product_id INTEGER NOT NULL,qty INTEGER NOT NULL,price INTEGER NOT NULL,total INTEGER NOT NULL,created TEXT NOT NULL,user_id INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'active');
+CREATE INDEX IF NOT EXISTS idx_dairy_sales_date ON dairy_sale_lines(created,status);
+CREATE TABLE IF NOT EXISTS dairy_payments(id INTEGER PRIMARY KEY,sale_id INTEGER NOT NULL,method TEXT NOT NULL,amount INTEGER NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS dairy_returns(id INTEGER PRIMARY KEY,line_id INTEGER NOT NULL,qty INTEGER NOT NULL,amount INTEGER NOT NULL,created TEXT NOT NULL,user_id INTEGER NOT NULL,reason TEXT NOT NULL,request_id TEXT UNIQUE NOT NULL);
+CREATE TABLE IF NOT EXISTS dairy_closures(id INTEGER PRIMARY KEY,day TEXT UNIQUE NOT NULL,expected INTEGER NOT NULL,counted INTEGER NOT NULL,difference INTEGER NOT NULL,closed_at TEXT NOT NULL,closed_by INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'closed',reopened_at TEXT,reopened_by INTEGER,reopen_reason TEXT NOT NULL DEFAULT '');

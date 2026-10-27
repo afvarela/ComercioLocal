@@ -1,0 +1,18 @@
+{
+  "account_id": "f676b563f2eb15892819adbdb07dcc67",
+  "d1": {
+    "binding": "DB",
+    "database_name": "comercio-local",
+    "database_id": "ac30ee74-641d-46ca-b1a4-bdb414b81ee9",
+    "applied_schema": "migrations/0001_initial.sql + migrations/0002_connection.sql"
+  },
+  "r2": {
+    "binding": "IMAGES",
+    "planned_bucket_name": "comercio-local-imagenes",
+    "created": true,
+    "blocked_by": null
+  },
+  "worker_deployed": false,
+  "local_data_imported": false,
+  "offline_sync_implemented": true
+}

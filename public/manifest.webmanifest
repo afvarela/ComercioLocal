@@ -1,0 +1,14 @@
+﻿{
+  "name": "Comercio Local",
+  "short_name": "Comercio",
+  "description": "Punto de venta para mini market y ferreteria con funcionamiento sin conexion.",
+  "id": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f1f4f2",
+  "theme_color": "#123f36",
+  "lang": "es-CO",
+  "icons": [{"src":"/favicon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}

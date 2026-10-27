@@ -1,0 +1,129 @@
+[
+  {
+    "sku": "VER-PAPA",
+    "name": "Papa común",
+    "image": "/images/papa.jpg"
+  },
+  {
+    "sku": "VER-TOMATE",
+    "name": "Tomate chonto",
+    "image": "/images/tomate.jpg"
+  },
+  {
+    "sku": "VER-CEBOLLA",
+    "name": "Cebolla cabezona",
+    "image": "/images/cebolla-cabezona.jpg"
+  },
+  {
+    "sku": "VER-JUNCA",
+    "name": "Cebolla larga",
+    "image": "/images/cebolla-larga.jpg"
+  },
+  {
+    "sku": "VER-ZANAHORIA",
+    "name": "Zanahoria",
+    "image": "/images/zanahoria.jpg"
+  },
+  {
+    "sku": "VER-ARVEJA",
+    "name": "Arveja verde",
+    "image": "/images/arveja.jpg"
+  },
+  {
+    "sku": "VER-HABICHUELA",
+    "name": "Habichuela",
+    "image": "/images/habichuela.jpg"
+  },
+  {
+    "sku": "VER-PEPINO",
+    "name": "Pepino cohombro",
+    "image": "/images/pepino.jpg"
+  },
+  {
+    "sku": "VER-PIMENTON",
+    "name": "Pimentón",
+    "image": "/images/pimenton.jpg"
+  },
+  {
+    "sku": "VER-REPOLLO",
+    "name": "Repollo",
+    "image": "/images/repollo.jpg"
+  },
+  {
+    "sku": "VER-PLATANO",
+    "name": "Plátano verde",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/platano.svg"
+  },
+  {
+    "sku": "VER-BANANO",
+    "name": "Banano",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/banano.svg"
+  },
+  {
+    "sku": "VER-CILANTRO",
+    "name": "Cilantro (manojo)",
+    "unit": "und",
+    "price_basis": 1,
+    "image": "/images/cilantro.svg"
+  },
+  {
+    "sku": "VER-AGUACATE",
+    "name": "Aguacate",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/aguacate.svg"
+  },
+  {
+    "sku": "VER-PAPA-AMARILLA",
+    "name": "Papa amarilla",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/papa.jpg"
+  },
+  {
+    "sku": "VER-PAPA-PASTUSA",
+    "name": "Papa pastusa",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/papa.jpg"
+  },
+  {
+    "sku": "VER-PLATANO-MADURO",
+    "name": "Plátano maduro",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/platano-maduro.svg"
+  },
+  {
+    "sku": "VER-MANGO",
+    "name": "Mango",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/mango.svg"
+  },
+  {
+    "sku": "VER-MANZANA",
+    "name": "Manzana",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/manzana.svg"
+  },
+  {
+    "sku": "VER-PERA",
+    "name": "Pera",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/pera.svg"
+  },
+  {
+    "sku": "VER-FRESA",
+    "name": "Fresa",
+    "unit": "g",
+    "price_basis": 500,
+    "image": "/images/fresa.svg"
+  }
+]

@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS cloud_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cloud_sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, password_version TEXT NOT NULL, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS cloud_attempts(key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS cloud_jobs(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, business_id INTEGER NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created INTEGER NOT NULL, expires INTEGER NOT NULL, result TEXT, status INTEGER);
+CREATE INDEX IF NOT EXISTS cloud_jobs_pending ON cloud_jobs(state,created);
+CREATE TABLE IF NOT EXISTS cloud_receipts(key TEXT PRIMARY KEY, business_id INTEGER NOT NULL, html TEXT NOT NULL);

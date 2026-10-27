@@ -1,0 +1,12 @@
+{
+  "name": "comercio-local",
+  "account_id": "f676b563f2eb15892819adbdb07dcc67",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {"enabled": true},
+  "assets": {"directory": "../public", "binding": "ASSETS", "run_worker_first": true},
+  "d1_databases": [{"binding": "DB", "database_name": "comercio-local", "database_id": "ac30ee74-641d-46ca-b1a4-bdb414b81ee9", "migrations_dir": "migrations"}],
+  "r2_buckets": [{"binding": "IMAGES", "bucket_name": "comercio-local-imagenes"}]
+}

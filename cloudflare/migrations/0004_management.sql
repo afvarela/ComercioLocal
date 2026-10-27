@@ -1,0 +1,13 @@
+ALTER TABLE products ADD COLUMN max_stock INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN reorder_point INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN lead_time_days INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE cash_sessions ADD COLUMN difference INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cash_sessions ADD COLUMN difference_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE cash_sessions ADD COLUMN difference_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE cash_sessions ADD COLUMN difference_note TEXT NOT NULL DEFAULT '';
+ALTER TABLE cash_sessions ADD COLUMN closed_by INTEGER;
+CREATE TABLE IF NOT EXISTS collections(id INTEGER PRIMARY KEY, business_id INTEGER NOT NULL, customer_id INTEGER NOT NULL, cash_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created TEXT NOT NULL, amount INTEGER NOT NULL, method TEXT NOT NULL, reference TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS collection_allocations(id INTEGER PRIMARY KEY, collection_id INTEGER NOT NULL, receivable_id INTEGER NOT NULL, sale_id INTEGER NOT NULL, amount INTEGER NOT NULL, balance_after INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS unregistered_sale_lines(id INTEGER PRIMARY KEY, sale_id INTEGER NOT NULL, description TEXT NOT NULL, qty INTEGER NOT NULL, unit TEXT NOT NULL DEFAULT 'und', price INTEGER NOT NULL, discount INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_collections_customer_date ON collections(business_id,customer_id,created);
+CREATE INDEX IF NOT EXISTS idx_unregistered_sale_lines_sale ON unregistered_sale_lines(sale_id);
