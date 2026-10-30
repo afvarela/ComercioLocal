@@ -62,6 +62,40 @@ test("el cobro usa teclado físico, foco en efectivo y Enter", () => {
   assert.match(source, /requestSubmit\(printButton\.current\)/);
 });
 
+test("el cobro bloquea todos los botones mientras procesa la venta", () => {
+  const modal = fs.readFileSync(new URL("../src/components/UI.jsx", import.meta.url), "utf8");
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  assert.match(modal, /Procesando venta…/);
+  assert.match(modal, /lockActions/);
+  assert.match(app, /saleCommit\.current/);
+  assert.match(app, /requestId: uid\(\)/);
+  assert.match(app, /payload\.request_id = modal\.requestId/);
+});
+
+test("productos no registrados usan opciones configurables y notas", () => {
+  const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
+  const migration = fs.readFileSync(new URL("../cloudflare/migrations/0014_unregistered_options.sql", import.meta.url), "utf8");
+  assert.match(form, /state\.unregistered_options/);
+  assert.match(form, /name="note"/);
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS unregistered_options/);
+});
+
+test("el recibo offline conserva centavos COP sin agregar tres ceros", () => {
+  const printer = fs.readFileSync(new URL("../src/lib/printer.js", import.meta.url), "utf8");
+  assert.match(printer, /cop\(lineTotal\(item\)\)/);
+  assert.match(printer, /Math\.round\(Number\(p\.amount\) \* 100\)/);
+  assert.doesNotMatch(printer, /item\.price \* item\.qty/);
+});
+
+test("ventas y reportes combinan filtros sin nuevas consultas por cada tecla", () => {
+  const pages = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  assert.match(pages, /customerFilter/);
+  assert.match(pages, /productFilter/);
+  assert.match(pages, /categoryFilter/);
+  assert.match(pages, /paymentFilter/);
+  assert.match(pages, /filteredSales/);
+});
+
 test("el POS muestra el error de inventario arriba y sin bloquear", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   const css = fs.readFileSync(new URL("../public/style.css", import.meta.url), "utf8");

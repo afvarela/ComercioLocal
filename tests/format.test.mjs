@@ -7,6 +7,7 @@ import {
   automaticProductQuantity,
   unregisteredLinePayload,
   unregisteredTypes,
+  gainMargin,
 } from "../src/lib/format.js";
 
 test("dos litros a 4000 cuestan 8000", () => {
@@ -48,11 +49,19 @@ test("un producto sin registrar conserva su precio al enviarse a la venta", () =
   };
   assert.deepEqual(unregisteredLinePayload(line), {
     description: "Producto no registrado",
+    option_id: null,
+    note: "",
     qty: 2,
     price: 4000,
     discount: 0,
   });
   assert.equal(cartTotal([line]), 800000);
+});
+
+test("calcula el margen de ganancia sobre el precio de venta", () => {
+  assert.equal(gainMargin(10000, 6000), 40);
+  assert.equal(gainMargin(0, 6000), 0);
+  assert.equal(gainMargin(10000, 12000), -20);
 });
 
 test("producto no registrado usa únicamente el listado fijo solicitado", () => {

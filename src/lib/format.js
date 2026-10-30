@@ -54,10 +54,16 @@ export const lineTotal = (l) =>
 export const cartTotal = (cart) => cart.reduce((s, l) => s + lineTotal(l), 0);
 export const unregisteredLinePayload = (line) => ({
   description: line.name || line.description || "Producto no registrado",
+  option_id: Number(line.option_id) || null,
+  note: String(line.note || "").trim(),
   qty: Number(line.qty),
   price: Number(line.originalPrice ?? line.price ?? 0) / 100,
   discount: Number(line.discount || 0) / 100,
 });
+export const gainMargin = (price, cost) => {
+  const selling = Number(price) || 0, purchase = Number(cost) || 0;
+  return selling > 0 ? ((selling - purchase) / selling) * 100 : 0;
+};
 export const saleNumber = (s, b) =>
   `${b === 1 ? "MM" : "FE"}-${String(s.number).padStart(6, "0")}`;
 export const normalize = (s) =>

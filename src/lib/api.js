@@ -124,6 +124,8 @@ function enqueueOperation(business, path, data, reason) {
   const queue = pendingSales();
   const action = offlineAction(path, data);
   const requestId = data.data.request_id || `${action}-${crypto.randomUUID()}`;
+  const existing = queue.find((item) => item.business === business && item.requestId === requestId);
+  if (existing) return { offline: true, id: existing.requestId, change: 0, duplicate: true };
   if (action === "sale") validateOfflineStock(business, data);
   if (action === "open_cash") {
     const cache = read(CACHE, {}), key = cacheKey(business, "/api/state"), state = cache[key];
@@ -151,8 +153,7 @@ function enqueueOperation(business, path, data, reason) {
     cache[key] = logistics;
     write(CACHE, cache);
   }
-  if (!queue.some((item) => item.requestId === requestId))
-    queue.push({ business, path, data, action, requestId, created: new Date().toISOString(), error: reason });
+  queue.push({ business, path, data, action, requestId, created: new Date().toISOString(), error: reason });
   write(QUEUE, queue);
   window.dispatchEvent(new Event("pos-queue-change"));
   return { offline: true, id: requestId, change: 0 };

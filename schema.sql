@@ -15,8 +15,13 @@ CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY, business_id INTEGER NO
 CREATE TABLE IF NOT EXISTS sales(id INTEGER PRIMARY KEY, business_id INTEGER NOT NULL REFERENCES businesses(id), number INTEGER NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id), cash_id INTEGER NOT NULL REFERENCES cash_sessions(id), customer_id INTEGER REFERENCES customers(id), created TEXT NOT NULL, total INTEGER NOT NULL, cost INTEGER NOT NULL, debt INTEGER NOT NULL DEFAULT 0, original_debt INTEGER NOT NULL DEFAULT 0, due TEXT, status TEXT NOT NULL DEFAULT 'active', void_reason TEXT, request_id TEXT NOT NULL, quote_id INTEGER REFERENCES quotes(id), cash_received INTEGER NOT NULL DEFAULT 0, change_given INTEGER NOT NULL DEFAULT 0, UNIQUE(business_id,number), UNIQUE(business_id,request_id));
 CREATE INDEX IF NOT EXISTS idx_sales_business_date ON sales(business_id,created);
 CREATE TABLE IF NOT EXISTS sale_lines(id INTEGER PRIMARY KEY, sale_id INTEGER NOT NULL REFERENCES sales(id), product_id INTEGER NOT NULL REFERENCES products(id), name TEXT NOT NULL, sku TEXT NOT NULL, unit TEXT NOT NULL, qty INTEGER NOT NULL CHECK(qty>0), price INTEGER NOT NULL, total INTEGER NOT NULL, cost INTEGER NOT NULL, allocations TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS unregistered_sale_lines(id INTEGER PRIMARY KEY, sale_id INTEGER NOT NULL REFERENCES sales(id), description TEXT NOT NULL, qty INTEGER NOT NULL, unit TEXT NOT NULL DEFAULT 'und', price INTEGER NOT NULL, discount INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS unregistered_options(id INTEGER PRIMARY KEY, business_id INTEGER NOT NULL REFERENCES businesses(id), name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(business_id,name));
+INSERT OR IGNORE INTO unregistered_options(business_id,name) SELECT id,'OTROS' FROM businesses;
+INSERT OR IGNORE INTO unregistered_options(business_id,name) SELECT id,'DULCES DETAL' FROM businesses;
+INSERT OR IGNORE INTO unregistered_options(business_id,name) SELECT id,'PAPELERIA' FROM businesses;
+CREATE TABLE IF NOT EXISTS unregistered_sale_lines(id INTEGER PRIMARY KEY, sale_id INTEGER NOT NULL REFERENCES sales(id), option_id INTEGER REFERENCES unregistered_options(id), description TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', qty INTEGER NOT NULL, unit TEXT NOT NULL DEFAULT 'und', price INTEGER NOT NULL, discount INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_unregistered_sale_lines_sale ON unregistered_sale_lines(sale_id);
+CREATE INDEX IF NOT EXISTS idx_unregistered_options_business ON unregistered_options(business_id,active,name);
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, business_id INTEGER NOT NULL REFERENCES businesses(id), sale_id INTEGER REFERENCES sales(id), cash_id INTEGER NOT NULL REFERENCES cash_sessions(id), user_id INTEGER NOT NULL REFERENCES users(id), created TEXT NOT NULL, method TEXT NOT NULL, amount INTEGER NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_payments_cash ON payments(cash_id);
 CREATE TABLE IF NOT EXISTS cash_moves(id INTEGER PRIMARY KEY, business_id INTEGER NOT NULL REFERENCES businesses(id), cash_id INTEGER NOT NULL REFERENCES cash_sessions(id), user_id INTEGER NOT NULL REFERENCES users(id), created TEXT NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL);
@@ -95,6 +100,12 @@ CREATE TABLE IF NOT EXISTS catalog_changes(
 );
 CREATE INDEX IF NOT EXISTS idx_catalog_changes_business_id ON catalog_changes(business_id,id);
 CREATE INDEX IF NOT EXISTS idx_products_catalog_page ON products(business_id,active,id);
+CREATE TABLE IF NOT EXISTS catalog_epochs(
+  business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
+  epoch INTEGER NOT NULL DEFAULT 1,
+  changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO catalog_epochs(business_id,epoch) SELECT id,1 FROM businesses;
 CREATE INDEX IF NOT EXISTS idx_products_name ON products(business_id,active,name COLLATE NOCASE,id);
 CREATE INDEX IF NOT EXISTS idx_products_category_name ON products(business_id,active,category,name,id);
 CREATE INDEX IF NOT EXISTS idx_lots_product_available ON lots(business_id,product_id,expires,qty);

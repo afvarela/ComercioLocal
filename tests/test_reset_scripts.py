@@ -31,6 +31,7 @@ class ResetScriptsTest(unittest.TestCase):
             "finance_accounts": 8,
             "dairy_products": 2,
             "label_settings": 2,
+            "unregistered_options": 6,
             "businesses": 2,
         }
         actual = {
@@ -38,6 +39,27 @@ class ResetScriptsTest(unittest.TestCase):
             for table in expected
         }
         self.assertEqual(actual, expected)
+        epochs = database.execute(
+            "SELECT business_id,epoch FROM catalog_epochs ORDER BY business_id"
+        ).fetchall()
+        self.assertEqual(epochs, [(1, 2), (2, 2)])
+        self.assertEqual(
+            database.execute("SELECT COUNT(*) FROM catalog_changes").fetchone()[0],
+            42,
+        )
+
+    def test_cloud_reset_script_does_not_export_or_create_backups(self):
+        script = (ROOT / "scripts" / "reset-cloud-data.ps1").read_text(encoding="utf-8")
+        launcher = (ROOT / "BORRAR-DATOS-PRUEBA-CLOUD.cmd").read_text(encoding="utf-8")
+        self.assertNotIn("d1 export", script.lower())
+        self.assertNotIn("BackupFolder", script)
+        self.assertIn("sin respaldo", script.lower())
+        self.assertIn("NO se creara respaldo", launcher)
+        manual = (ROOT / "cloudflare" / "BORRAR-DATOS-PRUEBA-MANUAL-D1.sql").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("UPDATE catalog_epochs", manual)
+        self.assertIn("DELETE FROM catalog_changes", manual)
 
 
 if __name__ == "__main__":

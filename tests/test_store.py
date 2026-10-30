@@ -111,6 +111,14 @@ class CommerceTests(unittest.TestCase):
         self.assertIn('Recibo de abono',self.store.receipt(1,'payment',r['id']))
         with self.assertRaises(ValueError): self.run_cmd('repay',{'sale_id':s['id'],'amount':6000,'method':'Efectivo'})
         self.assertEqual(self.store.state(self.u,1)['cash']['expected'],10300000)
+    def test_blank_credit_limit_is_unlimited_and_sku_is_generated(self):
+        product=self.run_cmd('product',{'sku':'','name':'Producto automático','unit':'und','price':5000})['id']
+        self.lot(product,2)
+        customer=self.run_cmd('customer',{'name':'Cliente sin límite','credit_limit':''})['id']
+        sale=self.sale(product,1,0,customer_id=customer,allow_credit=True,due=today())
+        with self.store.connect() as db:
+            self.assertTrue(db.execute('SELECT sku FROM products WHERE id=?',(product,)).fetchone()['sku'].startswith('AUTO-1-'))
+            self.assertEqual(db.execute('SELECT debt FROM sales WHERE id=?',(sale['id'],)).fetchone()['debt'],500000)
     def test_business_separation_and_quote(self):
         p=self.product();self.lot(p)
         h=self.product('Tornillo',price=1000,b=2);self.lot(h,10,500,b=2)
@@ -235,6 +243,19 @@ class CommerceTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT COUNT(*) FROM collection_allocations WHERE collection_id=?',(payment['id'],)).fetchone()[0],2)
         self.assertIn('Factura #1',self.store.receipt(1,'collection',payment['id']))
 
+    def test_customer_payment_can_target_invoice_and_is_idempotent(self):
+        p=self.product();self.lot(p,5);c=self.run_cmd('customer',{'name':'Cliente dirigido','credit_limit':0})['id']
+        first=self.sale(p,1,0,customer_id=c,allow_credit=True,due=today())
+        second=self.sale(p,1,0,customer_id=c,allow_credit=True,due=today())
+        request=uuid.uuid4().hex
+        payload={'customer_id':c,'amount':5000,'method':'Nequi','request_id':request,'allocations':[{'sale_id':second['id'],'amount':5000}]}
+        one=self.run_cmd('customer_payment',payload);two=self.run_cmd('customer_payment',payload)
+        self.assertEqual(one['id'],two['id'])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT debt FROM sales WHERE id=?',(first['id'],)).fetchone()[0],500000)
+            self.assertEqual(db.execute('SELECT debt FROM sales WHERE id=?',(second['id'],)).fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM collections WHERE request_id=?',(request,)).fetchone()[0],1)
+
     def test_cash_difference_requires_classification(self):
         with self.assertRaises(ValueError): self.run_cmd('close_cash',{'counted':99999})
         closed=self.run_cmd('close_cash',{'counted':99999,'difference_reason':'Error de conteo'})
@@ -249,6 +270,14 @@ class CommerceTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT total FROM sales WHERE id=?',(result['id'],)).fetchone()[0],550000)
             self.assertEqual(db.execute('SELECT total FROM unregistered_sale_lines WHERE sale_id=?',(result['id'],)).fetchone()[0],550000)
         self.assertIn('DULCES DETAL',self.store.receipt(1,'sale',result['id']))
+
+    def test_unregistered_options_and_note_are_saved(self):
+        option=self.run_cmd('unregistered_option',{'name':'Empaques'})['id']
+        result=self.run_cmd('sale',{'request_id':uuid.uuid4().hex,'unregistered_lines':[{'option_id':option,'description':'EMPAQUES','note':'Caja roja','qty':1,'price':3000}],'payments':[{'method':'Efectivo','amount':3000}]})
+        with self.store.connect() as db:
+            line=db.execute('SELECT option_id,note FROM unregistered_sale_lines WHERE sale_id=?',(result['id'],)).fetchone()
+            self.assertEqual(tuple(line),(option,'Caja roja'))
+        self.assertIn('Caja roja',self.store.receipt(1,'sale',result['id']))
 
     def test_analytics_returns_business_indicators(self):
         p=self.product();self.lot(p);self.sale(p)

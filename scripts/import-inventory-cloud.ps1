@@ -43,8 +43,36 @@ $BackupFolder = Join-Path $Project 'backups\d1'
 New-Item -ItemType Directory -Force -Path $BackupFolder | Out-Null
 $Backup = Join-Path $BackupFolder ("comercio-local-antes-inventario-{0}.sql" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
-Write-Host '1/5 Exportando respaldo de D1...'
-& $Node $Wrangler d1 export comercio-local --remote --output $Backup --config cloudflare/wrangler.jsonc
+Write-Host '1/5 Exportando respaldo de las tablas reales de D1...'
+# D1 no permite exportar una base completa que contenga tablas virtuales FTS5.
+# Se respaldan los datos de todas las tablas reales declaradas en schema.sql;
+# product_search y sus tablas internas se reconstruyen mediante sus triggers.
+$SchemaFile = Join-Path $Project 'schema.sql'
+$SchemaText = [IO.File]::ReadAllText($SchemaFile)
+$DeclaredTables = @(
+    [regex]::Matches($SchemaText, '(?im)^\s*CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)') |
+        ForEach-Object { $_.Groups[1].Value } |
+        Sort-Object -Unique
+)
+$RemoteTablesQuery = "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+$RemoteTablesRaw = & $Node $Wrangler d1 execute comercio-local --remote --command $RemoteTablesQuery --json --config cloudflare/wrangler.jsonc
+if ($LASTEXITCODE -ne 0) {
+    throw 'No se pudo consultar la estructura actual de D1. No se modifico D1.'
+}
+$RemoteTablesResult = $RemoteTablesRaw | ConvertFrom-Json
+$RemoteTables = @($RemoteTablesResult[0].results | ForEach-Object { $_.name })
+$BackupTables = @($DeclaredTables | Where-Object { $RemoteTables -contains $_ })
+if (-not $BackupTables.Count) {
+    throw 'No se encontraron tablas reales para respaldar. No se modifico D1.'
+}
+$BackupArguments = @(
+    'd1', 'export', 'comercio-local', '--remote', '--skip-confirmation',
+    '--no-schema', '--output', $Backup, '--config', 'cloudflare/wrangler.jsonc'
+)
+foreach ($Table in $BackupTables) {
+    $BackupArguments += @('--table', $Table)
+}
+& $Node $Wrangler @BackupArguments
 if ($LASTEXITCODE -ne 0) { throw 'No se creo el respaldo. No se modifico D1.' }
 
 Write-Host '2/5 Verificando que la importacion anterior no tenga ventas...'

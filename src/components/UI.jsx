@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { Children, cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 export function Button({
   children,
   primary = false,
@@ -168,6 +168,13 @@ export function Modal({
       setLoading(false);
     }
   }
+  const lockActions = (node) => Children.map(node, (child) => {
+    if (!isValidElement(child)) return child;
+    const nested = child.props?.children ? lockActions(child.props.children) : child.props?.children;
+    if (child.type === "button" || child.type === Button)
+      return cloneElement(child, { disabled: loading || child.props.disabled, children: nested });
+    return nested === child.props?.children ? child : cloneElement(child, { children: nested });
+  });
   return (
     <dialog
       ref={ref}
@@ -194,8 +201,9 @@ export function Modal({
             {error}
           </div>
         )}
+        {loading && <div className="notice info processing-sale" role="status" aria-live="assertive"><b>Procesando venta…</b> No cierre ni repita la operación.</div>}
         {children}
-        {onSubmit && (actions || (
+        {onSubmit && (actions ? lockActions(actions) : (
           <div className="dialog-actions">
             <Button type="button" disabled={loading} onClick={onClose}>
               Cancelar

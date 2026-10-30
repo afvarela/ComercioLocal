@@ -24,11 +24,13 @@ export default function OperationForm({
   const { type, id } = config;
   const safeHistory = history || {},
     products = state.products || [],
+    allProducts = [...products, ...(state.inactive_products || [])],
     customers = state.customers || [],
     lots = state.lots || [],
     businesses = state.businesses || [],
-    product = products.find((p) => p.id === id) || {},
+    product = allProducts.find((p) => p.id === id) || {},
     customer = customers.find((c) => c.id === id) || {},
+    unregisteredOption = (state.unregistered_options || []).find((option) => option.id === id) || {},
     lot = lots.find((l) => l.id === id) || {},
     sale = (safeHistory.debts || []).find((s) => s.id === id) || {},
     editedUser = (safeHistory.users || []).find((x) => x.id === id) || {},
@@ -145,9 +147,8 @@ export default function OperationForm({
           />
           <Field
             name="sku"
-            label="Referencia / SKU"
+            label="Referencia / SKU (opcional)"
             defaultValue={product.sku || ""}
-            required
           />
           <Field
             name="barcode"
@@ -209,6 +210,15 @@ export default function OperationForm({
               Producto perecedero
             </label>
           </div>
+          {id && (
+            <div className="field">
+              <label>Estado del producto</label>
+              <label className="check">
+                <input type="checkbox" name="active" value="1" defaultChecked={!!product.active} />
+                Producto activo y visible en el punto de venta
+              </label>
+            </div>
+          )}
           <div className="wide">
             <Field
               name="description"
@@ -365,14 +375,15 @@ export default function OperationForm({
             {admin && (
               <MoneyField
                 name="credit_limit"
-                label="Cupo máximo para fiados"
-                defaultValue={(customer.credit_limit || 0) / 100}
+                label="Cupo máximo para fiados (opcional)"
+                defaultValue={customer.credit_limit ? customer.credit_limit / 100 : ""}
+                required={false}
               />
             )}
           </div>
           <p className="print-note">
-            El cupo en cero impide fiar. Solo el administrador asigna o aumenta
-            el cupo.
+            Si deja el cupo vacío o en cero, el cliente no tendrá un límite definido.
+            Solo el administrador puede modificarlo.
           </p>
         </>
       );
@@ -417,7 +428,11 @@ export default function OperationForm({
     case "unregistered_product":
       title = "Producto no registrado";
       submit = "Agregar a la venta";
-      body = <><Notice info>Este ítem no descontará inventario.</Notice><Select name="description" label="Tipo de producto" defaultValue="OTROS">{unregisteredTypes.map((type)=><option key={type} value={type}>{type}</option>)}</Select><Field name="qty" label="Cantidad" type="number" min="1" step="1" defaultValue="1" required/><MoneyField name="price" label="Precio a facturar por unidad" defaultValue="0"/></>;
+      {const options=(state.unregistered_options || []).filter(option=>option.active);body = <><Notice info>Este ítem no descontará inventario.</Notice><Select name="option_id" label="Tipo de producto" defaultValue={options[0]?.id || ""}>{options.length?options.map((option)=><option key={option.id} value={option.id}>{option.name}</option>):unregisteredTypes.map((type)=><option key={type} value={type}>{type}</option>)}</Select><Field name="qty" label="Cantidad" type="number" min="1" step="1" defaultValue="1" required/><MoneyField name="price" label="Precio a facturar por unidad" defaultValue="0"/><Field name="note" label="Nota / detalle (opcional)" maxLength="500" placeholder="Ejemplo: color, presentación o referencia indicada por el cliente"/></>;}
+      break;
+    case "unregistered_option":
+      title = id ? "Editar opción de producto no registrado" : "Nueva opción de producto no registrado";
+      body = <><Field name="name" label="Nombre de la opción" defaultValue={unregisteredOption.name || ""} required />{id&&<label className="check"><input type="checkbox" name="active" value="1" defaultChecked={!!unregisteredOption.active}/> Opción activa y visible al vender</label>}</>;
       break;
     case "cash_move":
       title = "Entrada o retiro de efectivo";
@@ -464,9 +479,9 @@ export default function OperationForm({
       );
       break;
     case "customer_payment":
-      title = "Registrar abono del cliente";
-      submit = "Aplicar a facturas antiguas";
-      body = <><Notice info>El valor se aplica automáticamente a las facturas pendientes más antiguas. El recibo mostrará cómo fue distribuido.</Notice><input type="hidden" name="customer_id" value={config.id}/><MoneyField name="amount" label="Valor recibido" defaultValue="0"/><Select name="method" label="Medio de pago"><option>Efectivo</option><option>Nequi</option><option>Daviplata</option><option>Bancolombia</option><option>Datáfono</option></Select><Field name="reference" label="Referencia u observación"/></>;
+      title = "Pagar saldo del cliente";
+      submit = "Registrar pago";
+      {const invoices=(safeHistory.debts||[]).filter(debt=>Number(debt.customer_id)===Number(config.id));body = <><Notice info>Puede pagar el saldo total o una parte. Si no distribuye valores por factura, el pago se aplica primero a las más antiguas.</Notice><input type="hidden" name="customer_id" value={config.id}/><MoneyField name="amount" label="Valor total recibido" defaultValue={(customer.balance || 0) / 100} max={(customer.balance || 0) / 100}/><div className="invoice-allocation-list"><b>Aplicar a facturas específicas (opcional)</b>{invoices.map(invoice=><MoneyField key={invoice.id} name={`invoice_${invoice.id}`} label={`${saleNumber(invoice,business)} · saldo ${cop(invoice.debt)}`} defaultValue="" max={invoice.debt/100} required={false}/>)}</div><Select name="method" label="Medio de pago">{methods.map(method=><option key={method}>{method}</option>)}</Select><Field name="reference" label="Referencia u observación"/></>;}
       break;
     case "quote":
       title = "Guardar cotización";

@@ -1,3 +1,5 @@
+import { cop, lineTotal, qty } from "./format.js";
+
 const AGENT = "http://127.0.0.1:8768";
 const KEY = "comercio-pos-printer";
 const DISPATCH_KEY = "comercio-dispatch-printer";
@@ -81,16 +83,17 @@ export async function printLabels(business, html) {
     return callLabelAgent({method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({printer,pages})});
   }finally{URL.revokeObjectURL(source);frame.remove()}
 }
-export async function printOfflineSale({ businessName, requestId, cart, payments, total }) {
+export async function printOfflineSale({ businessName, requestId, cart, payments, total, cashReceived = 0, change = 0 }) {
   const printer = selectedPrinter();
   if (!printer) throw Error("No hay una impresora de recibos configurada en este equipo");
-  const money = (value) => "$ " + Number(value || 0).toLocaleString("es-CO", { minimumFractionDigits: 2 });
   const lines = [
     "COMERCIO LOCAL", businessName, "VENTA PENDIENTE DE SINCRONIZAR",
     new Date().toLocaleString("es-CO"), `Referencia: ${requestId}`, "--------------------------------",
-    ...cart.flatMap((item) => [item.name, `${item.qty} ${item.unit}  ${money(item.price * item.qty)}`]),
-    "--------------------------------", `TOTAL: ${money(total)}`,
-    ...payments.filter((p) => Number(p.amount) > 0).map((p) => `${p.method}: ${money(p.amount)}`),
+    ...cart.flatMap((item) => [item.name, ...(item.note ? [`Nota: ${item.note}`] : []), `${qty(item.qty, item.unit)} ${item.unit}  ${cop(lineTotal(item))}`]),
+    "--------------------------------", `TOTAL: ${cop(total)}`,
+    ...payments.filter((p) => Number(p.amount) > 0).map((p) => `${p.method}: ${cop(Math.round(Number(p.amount) * 100))}`),
+    ...(Number(cashReceived) > 0 ? [`Efectivo recibido: ${cop(Number(cashReceived))}`] : []),
+    ...(Number(change) > 0 ? [`Cambio: ${cop(Number(change))}`] : []),
     "", "Se registrara en el sistema al recuperar la conexion.", "", "",
   ];
   return call("/print", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ printer, text: lines.join("\n") }) });

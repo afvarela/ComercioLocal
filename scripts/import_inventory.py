@@ -22,6 +22,9 @@ SKU_PREFIX = "TDESC-"
 LOT_PREFIX = "TDESC-IMPORT-"
 IMPORT_REFERENCE = "Importacion Excel Tienda El Descanso"
 EXPECTED_HEADERS = ("nombre del producto", "um", "precio de venta", "costo", "inventario")
+EXCLUDED_IMPORTED_NAMES = {
+    "TOMATE CHONTO", "PAPA", "PLATANO MAD", "CEBOLLA CABEZONA", "AJO", "AGUACATE",
+}
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,8 @@ def load_products(path: Path, sheet_name: str = "Productos") -> list[ProductRow]
     for row, values in enumerate(rows, start=2):
         name = clean(values[0])
         if not name:
+            continue
+        if name.upper() in EXCLUDED_IMPORTED_NAMES:
             continue
         source_unit = clean(values[1]) or "un"
         unit, basis, qty = unit_and_qty(source_unit, values[4], row)

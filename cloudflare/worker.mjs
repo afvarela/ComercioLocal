@@ -16,7 +16,7 @@ export default {async fetch(request,env){
  const url=new URL(request.url),path=url.pathname,q=url.searchParams,post=request.method==='POST';
  metrics=instrumentDatabase(env.DB,path,env.D1_METRICS==='1');env={...env,DB:metrics.db};
  if(!['GET','POST','HEAD'].includes(request.method))return json({error:'Método no permitido'},405);
- if(path==='/api/status')return json({setup:!(await one(env.DB,'SELECT 1 present FROM users WHERE active=1 LIMIT 1')),cloud:true,version:'3.3.4'});
+ if(path==='/api/status')return json({setup:!(await one(env.DB,'SELECT 1 present FROM users WHERE active=1 LIMIT 1')),cloud:true,version:'3.3.6'});
  if(path.startsWith('/images/')){check(/^\/images\/[a-z0-9-]+\.(jpg|jpeg|png|webp|svg)$/.test(path),'Imagen invalida');const name=path.slice('/images/'.length),object=await env.IMAGES.get('products/'+name);if(!object)return env.ASSETS.fetch(request);const h=new Headers(headers);object.writeHttpMetadata(h);const extension=name.split('.').pop(),types={jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',webp:'image/webp',svg:'image/svg+xml; charset=utf-8'};h.set('Content-Type',types[extension]);h.set('ETag',object.httpEtag);h.set('Cache-Control','public,max-age=86400');return new Response(object.body,{headers:h});}
  if(!post&&!path.startsWith('/api/')&&!['/receipt','/receipt.txt','/invoice','/invoice.pdf','/dispatch','/dispatch.txt'].includes(path))return env.ASSETS.fetch(request);
  let d={};if(post){check(request.headers.get('X-POS-Request')==='1','Solicitud no autorizada');check(request.headers.get('Origin')===url.origin,'Origen no permitido');const text=await request.text();check(text.length<=1048576,'Solicitud demasiado grande');d=JSON.parse(text);}

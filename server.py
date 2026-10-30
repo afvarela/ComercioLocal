@@ -98,6 +98,9 @@ class Store:
         with self.connect() as db:
             db.executescript((ROOT/'schema.sql').read_text('utf-8'))
             db.execute("CREATE TABLE IF NOT EXISTS app_migrations(name TEXT PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            unregistered_columns={row['name'] for row in db.execute('PRAGMA table_info(unregistered_sale_lines)')}
+            if 'option_id' not in unregistered_columns: db.execute('ALTER TABLE unregistered_sale_lines ADD COLUMN option_id INTEGER REFERENCES unregistered_options(id)')
+            if 'note' not in unregistered_columns: db.execute("ALTER TABLE unregistered_sale_lines ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             if not db.execute("SELECT 1 FROM app_migrations WHERE name='0013_clean_product_search'").fetchone():
                 # Rebuild only the derived search index. Excel traceability stays
                 # in products.description but no longer pollutes commercial search.
@@ -254,13 +257,14 @@ class Store:
     def state(self,u,b,include_catalog=True,details=True,include_customers=True):
         with self.connect() as db:
             products=self.rows(db,'''SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available FROM products p LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id WHERE p.business_id=? AND p.active=1 GROUP BY p.id ORDER BY p.name''',(today(),b)) if include_catalog else []
+            inactive_products=self.rows(db,'''SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available FROM products p LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id WHERE p.business_id=? AND p.active=0 GROUP BY p.id ORDER BY p.name''',(today(),b)) if details else []
             lots=self.rows(db,'SELECT l.*,p.name,p.unit FROM lots l JOIN products p ON p.id=l.product_id WHERE l.business_id=? AND l.qty>0 ORDER BY COALESCE(l.expires,\'9999\'),l.id',(b,)) if details else []
             if u['role']!='admin':
                 for l in lots: l.pop('cost',None)
             c=self.one(db,'SELECT c.*,u.name operator FROM cash_sessions c JOIN users u ON u.id=c.user_id WHERE c.business_id=? AND c.closed IS NULL',(b,))
             if c: c['expected']=self.expected(db,c)
             customers=self.rows(db,"SELECT c.*,COALESCE(s.balance,0) balance,COALESCE(s.total_purchases,0) total_purchases,COALESCE(s.purchase_count,0) purchase_count FROM customers c LEFT JOIN (SELECT customer_id,SUM(debt) balance,SUM(total) total_purchases,COUNT(*) purchase_count FROM sales WHERE business_id=? AND status='active' GROUP BY customer_id) s ON s.customer_id=c.id WHERE c.business_id=? ORDER BY c.name",(b,b)) if include_customers else []
-            return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'lots':lots,'customers':customers,'cash':c,'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
+            return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'inactive_products':inactive_products,'lots':lots,'customers':customers,'cash':c,'unregistered_options':self.rows(db,'SELECT * FROM unregistered_options WHERE business_id=? AND (active=1 OR ?=1) ORDER BY active DESC,name',(b,int(u['role']=='admin'))),'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
     def lines(self,db,b,raw,stock=True):
         require(isinstance(raw,list) and 0<len(raw)<=300,'Agregue productos a la venta')
         combined={}
@@ -288,15 +292,18 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             result={ 'ok':True }
             if action=='product':
-                self.admin(u); name=clean(d.get('name')); sku=clean(d.get('sku')); unit=d.get('unit')
-                require(name and sku and unit in ('und','g','m'),'Nombre, referencia y unidad son obligatorios')
-                vals=(sku,clean(d.get('barcode')) or None,name,clean(d.get('description'),1000),clean(d.get('category')),unit,money(d['price']),quantity(d.get('min_stock',0),unit),int(bool(d.get('perishable'))))
+                self.admin(u); name=clean(d.get('name')); unit=d.get('unit')
+                old=self.scoped(db,'products',d['id'],b) if d.get('id') else None
+                sku=clean(d.get('sku')) or (old['sku'] if old else f'AUTO-{b}-{secrets.token_hex(6).upper()}')
+                require(name and unit in ('und','g','m'),'Nombre y unidad son obligatorios')
+                active=int(bool(d.get('active'))) if d.get('id') else 1
+                vals=(sku,clean(d.get('barcode')) or None,name,clean(d.get('description'),1000),clean(d.get('category')),unit,money(d['price']),quantity(d.get('min_stock',0),unit),int(bool(d.get('perishable'))),active)
                 basis=int(d.get('price_basis',1000)); require(basis in (500,1000),'Base de precio inválida')
                 if d.get('id'):
-                    old=self.scoped(db,'products',d['id'],b); require(old['unit']==unit,'No se puede cambiar la unidad de un producto existente')
-                    db.execute('UPDATE products SET sku=?,barcode=?,name=?,description=?,category=?,unit=?,price=?,min_stock=?,perishable=? WHERE id=? AND business_id=?',(*vals,d['id'],b))
+                    require(old['unit']==unit,'No se puede cambiar la unidad de un producto existente')
+                    db.execute('UPDATE products SET sku=?,barcode=?,name=?,description=?,category=?,unit=?,price=?,min_stock=?,perishable=?,active=? WHERE id=? AND business_id=?',(*vals,d['id'],b))
                     db.execute('UPDATE products SET price_basis=? WHERE id=? AND business_id=?',(basis,d['id'],b))
-                else: result['id']=db.execute('INSERT INTO products(business_id,sku,barcode,name,description,category,unit,price,min_stock,perishable) VALUES(?,?,?,?,?,?,?,?,?,?)',(b,*vals)).lastrowid
+                else: result['id']=db.execute('INSERT INTO products(business_id,sku,barcode,name,description,category,unit,price,min_stock,perishable,active) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(b,*vals)).lastrowid
                 if not d.get('id'): db.execute('UPDATE products SET price_basis=? WHERE id=?',(basis,result['id']))
                 pid=int(d.get('id') or result['id']); max_stock=quantity(d.get('max_stock',0),unit); reorder=quantity(d.get('reorder_point',0),unit); lead=int(d.get('lead_time_days',3) or 0)
                 require(max_stock>=0 and reorder>=0 and 0<=lead<=365,'Revise los parámetros de reposición')
@@ -339,11 +346,19 @@ class Store:
                 db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lot['id'],u['id'],now(),-q,'Ajuste negativo',reason,lot['cost'],lot['cost_basis'],balance,reason))
             elif action=='customer':
                 require(clean(d.get('name')),'Indique el nombre del cliente'); email=clean(d.get('email')); require(not email or re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email),'Correo inválido')
-                if u['role']!='admin': require(money(d.get('credit_limit',0))==0,'Solo el administrador asigna cupos de crédito')
-                vals=(clean(d['name']),clean(d.get('document')),clean(d.get('phone')),email,money(d.get('credit_limit',0)))
+                credit_limit=money(d.get('credit_limit') or 0)
+                if u['role']!='admin': require(credit_limit==0,'Solo el administrador asigna cupos de crédito')
+                vals=(clean(d['name']),clean(d.get('document')),clean(d.get('phone')),email,credit_limit)
                 if d.get('id'):
                     self.admin(u); self.scoped(db,'customers',d['id'],b); db.execute('UPDATE customers SET name=?,document=?,phone=?,email=?,credit_limit=? WHERE id=? AND business_id=?',(*vals,d['id'],b))
                 else: result['id']=db.execute('INSERT INTO customers(business_id,name,document,phone,email,credit_limit) VALUES(?,?,?,?,?,?)',(b,*vals)).lastrowid
+            elif action=='unregistered_option':
+                name=clean(d.get('name')).upper(); require(name,'Escriba el nombre de la opción')
+                if d.get('id'):
+                    row=self.one(db,'SELECT * FROM unregistered_options WHERE id=? AND business_id=?',(d['id'],b)); require(row,'Opción no encontrada')
+                    db.execute('UPDATE unregistered_options SET name=?,active=?,updated=? WHERE id=? AND business_id=?',(name,int(bool(d.get('active',True))),now(),d['id'],b)); result['id']=d['id']
+                else:
+                    result['id']=db.execute('INSERT INTO unregistered_options(business_id,name,active,created,updated) VALUES(?,?,1,?,?)',(b,name,now(),now())).lastrowid
             elif action=='open_cash':
                 require(not db.execute('SELECT 1 FROM cash_sessions WHERE business_id=? AND closed IS NULL',(b,)).fetchone(),'Ya hay una caja abierta')
                 result['id']=db.execute('INSERT INTO cash_sessions(business_id,user_id,opened,opening,note) VALUES(?,?,?,?,?)',(b,u['id'],now(),money(d['opening']),clean(d.get('note'),1000))).lastrowid; result['receipt']='cash'
@@ -364,18 +379,27 @@ class Store:
                 result.update(id=c['id'],receipt='cash',difference=difference,difference_type=dtype)
             elif action=='customer_payment':
                 c=self.cash(db,b); cid=int(d.get('customer_id') or 0); self.scoped(db,'customers',cid,b)
-                method=d.get('method'); require(method in METHODS,'Medio de pago inválido')
-                value=money(d.get('amount')); require(value>0,'Ingrese un valor mayor que cero')
-                pending=self.rows(db,"SELECT * FROM receivables WHERE business_id=? AND customer_id=? AND balance>0 AND status!='Anulado' ORDER BY created,id",(b,cid))
-                require(pending,'El cliente no tiene cuentas pendientes'); require(value<=sum(x['balance'] for x in pending),'El abono supera el saldo total del cliente')
                 request=clean(d.get('request_id')) or secrets.token_urlsafe(18)
                 existing=self.one(db,'SELECT id FROM collections WHERE request_id=?',(request,))
                 if existing: return {'ok':True,'id':existing['id'],'receipt':'collection'}
+                method=d.get('method'); require(method in METHODS,'Medio de pago inválido')
+                value=money(d.get('amount')); require(value>0,'Ingrese un valor mayor que cero')
+                pending=self.rows(db,"SELECT * FROM receivables WHERE business_id=? AND customer_id=? AND balance>0 AND status!='Anulado' ORDER BY created,id",(b,cid))
+                require(pending,'El cliente no tiene cuentas pendientes')
+                requested=d.get('allocations') or []
+                if requested:
+                    pending_by_sale={int(row['sale_id']):row for row in pending}; selected=[]; seen=set()
+                    for item in requested:
+                        sale_id=int(item.get('sale_id') or 0); require(sale_id in pending_by_sale and sale_id not in seen,'Factura inválida o repetida')
+                        applied=money(item.get('amount')); require(0<applied<=pending_by_sale[sale_id]['balance'],'El pago supera el saldo de una factura')
+                        selected.append({**pending_by_sale[sale_id],'requested':applied}); seen.add(sale_id)
+                    require(value==sum(row['requested'] for row in selected),'La distribución no coincide con el valor recibido'); pending=selected
+                require(value<=sum(x['balance'] for x in pending),'El abono supera el saldo total del cliente')
                 collection=db.execute('INSERT INTO collections(business_id,customer_id,cash_id,user_id,created,amount,method,reference,request_id) VALUES(?,?,?,?,?,?,?,?,?)',(b,cid,c['id'],u['id'],now(),value,method,clean(d.get('reference')),request)).lastrowid
                 payment=db.execute("INSERT INTO payments(business_id,cash_id,user_id,created,method,amount,kind,reference) VALUES(?,?,?,?,?,?,'Abono',?)",(b,c['id'],u['id'],now(),method,value,clean(d.get('reference')))).lastrowid
                 remaining=value; applied_count=0
                 for rec in pending:
-                    applied=min(remaining,rec['balance']); new=rec['balance']-applied; status='Pagado' if new==0 else 'Parcialmente pagado'
+                    applied=rec['requested'] if isinstance(rec,dict) and 'requested' in rec else min(remaining,rec['balance']); new=rec['balance']-applied; status='Pagado' if new==0 else 'Parcialmente pagado'
                     db.execute('UPDATE receivables SET paid_amount=paid_amount+?,balance=?,status=? WHERE id=?',(applied,new,status,rec['id']))
                     db.execute('UPDATE sales SET debt=? WHERE id=?',(new,rec['sale_id']))
                     db.execute('INSERT INTO collection_allocations(collection_id,receivable_id,sale_id,amount,balance_after) VALUES(?,?,?,?,?)',(collection,rec['id'],rec['sale_id'],applied,new))
@@ -387,7 +411,7 @@ class Store:
                 require(b==2,'Las cotizaciones están disponibles en ferretería'); raw=d.get('lines') or []; lines=self.lines(db,b,raw,False) if raw else []
                 for item in d.get('unregistered_lines') or []:
                     q=quantity(item.get('qty',1),'und'); price=money(item.get('price')); description=clean(item.get('description')) or 'OTROS'; require(q>0 and price>0,'Revise el producto no registrado de la cotización')
-                    lines.append({'product_id':None,'unregistered':True,'name':description,'description':'Concepto sin control de inventario','sku':'NO-CATALOGADO','unit':'und','qty':q,'price':price,'price_basis':1,'total':q*price,'cost':0,'allocations':[]})
+                    note=clean(item.get('note'),500); lines.append({'product_id':None,'option_id':int(item.get('option_id') or 0) or None,'note':note,'unregistered':True,'name':description+(f' · {note}' if note else ''),'description':note or 'Concepto sin control de inventario','sku':'NO-CATALOGADO','unit':'und','qty':q,'price':price,'price_basis':1,'total':q*price,'cost':0,'allocations':[]})
                 require(lines,'Agregue productos a la cotización'); cid=d.get('customer_id') or None
                 if cid: self.scoped(db,'customers',cid,b)
                 valid=iso(d.get('valid_until')); require(valid>=today(),'La vigencia no puede estar en el pasado')
@@ -409,7 +433,9 @@ class Store:
                 for item in extras:
                     description=clean(item.get('description')); q=quantity(item.get('qty',1),'und'); price=money(item.get('price')); discount=money(item.get('discount',0))
                     require(description and q>0 and price>0 and discount<=price*q,'Revise el producto no registrado')
-                    clean_extras.append({'description':description,'qty':q,'unit':'und','price':price,'discount':discount,'total':price*q-discount})
+                    option_id=int(item.get('option_id') or 0) or None
+                    if option_id: require(self.one(db,'SELECT id FROM unregistered_options WHERE id=? AND business_id=?',(option_id,b)),'Tipo de producto no registrado inválido')
+                    clean_extras.append({'option_id':option_id,'description':description,'note':clean(item.get('note'),500),'qty':q,'unit':'und','price':price,'discount':discount,'total':price*q-discount})
                 total=sum(l['total'] for l in lines)+sum(x['total'] for x in clean_extras); dairy_total=sum(x['total'] for x in dairy); grand_total=total+dairy_total; cost=sum(l['cost'] for l in lines)
                 quote_id=d.get('quote_id') or None
                 if quote_id:
@@ -425,7 +451,7 @@ class Store:
                 if debt:
                     require(d.get('allow_credit') and customer,'Seleccione un cliente y autorice el saldo fiado')
                     current=db.execute("SELECT COALESCE(SUM(debt),0) FROM sales WHERE customer_id=? AND status='active'",(cid,)).fetchone()[0]
-                    require(current+debt<=customer['credit_limit'],'El saldo excede el cupo de crédito del cliente')
+                    require(not customer['credit_limit'] or current+debt<=customer['credit_limit'],'El saldo excede el cupo de crédito del cliente')
                     due=iso(d.get('due')); require(due>=today(),'La fecha de pago no puede estar en el pasado')
                 else: due=None
                 number=db.execute('SELECT COALESCE(MAX(number),0)+1 FROM sales WHERE business_id=?',(b,)).fetchone()[0]
@@ -440,7 +466,7 @@ class Store:
                         lot=self.one(db,'SELECT cost,cost_basis FROM lots WHERE id=?',(a['lot_id'],)); balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(l['product_id'],)).fetchone()[0]
                         db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,l['product_id'],a['lot_id'],u['id'],now(),-a['qty'],'Venta',f'VTA-{number:06d}',lot['cost'],lot['cost_basis'],balance,''))
                 for x in clean_extras:
-                    db.execute('INSERT INTO unregistered_sale_lines(sale_id,description,qty,unit,price,discount,total) VALUES(?,?,?,?,?,?,?)',(sid,x['description'],x['qty'],x['unit'],x['price'],x['discount'],x['total']))
+                    db.execute('INSERT INTO unregistered_sale_lines(sale_id,option_id,description,note,qty,unit,price,discount,total) VALUES(?,?,?,?,?,?,?,?,?)',(sid,x['option_id'],x['description'],x['note'],x['qty'],x['unit'],x['price'],x['discount'],x['total']))
                 sale_time=now()
                 for x in dairy: db.execute('INSERT INTO dairy_sale_lines(sale_id,product_id,qty,price,total,created,user_id) VALUES(?,?,?,?,?,?,?)',(sid,x['id'],x['qty'],x['price'],x['total'],sale_time,u['id']))
                 pending_change=change; dairy_remaining=dairy_total
@@ -453,6 +479,9 @@ class Store:
                 result.update(id=sid,receipt='sale',change=change)
             elif action=='repay':
                 c=self.cash(db,b); sale=self.scoped(db,'sales',d['sale_id'],b); val=money(d['amount']); method=d['method']
+                request=clean(d.get('request_id')) or secrets.token_urlsafe(18)
+                existing=self.one(db,'SELECT payment_id FROM receivable_moves WHERE request_id=?',(request,))
+                if existing: return {'ok':True,'id':existing['payment_id'],'receipt':'payment'}
                 require(sale['status']=='active' and 0<val<=sale['debt'],'El abono debe ser positivo y no superar el saldo'); require(method in METHODS,'Medio inválido')
                 result['id']=db.execute('INSERT INTO payments(business_id,sale_id,cash_id,user_id,created,method,amount,kind,reference) VALUES(?,?,?,?,?,?,?,?,?)',(b,sale['id'],c['id'],u['id'],now(),method,val,'Abono',clean(d.get('reference')))).lastrowid
                 db.execute('UPDATE sales SET debt=debt-? WHERE id=?',(val,sale['id']))
@@ -460,7 +489,7 @@ class Store:
                 balance=receivable['balance']-val
                 status='Pagado' if balance==0 else 'Parcialmente pagado'
                 db.execute('UPDATE receivables SET paid_amount=paid_amount+?,balance=?,status=? WHERE id=?',(val,balance,status,receivable['id']))
-                db.execute('INSERT INTO receivable_moves(receivable_id,business_id,customer_id,sale_id,payment_id,created,kind,amount,balance_after,user_id,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(receivable['id'],b,receivable['customer_id'],sale['id'],result['id'],now(),'Abono',-val,balance,u['id'],clean(d.get('reference')),clean(d.get('request_id')) or f'abono-{result["id"]}'))
+                db.execute('INSERT INTO receivable_moves(receivable_id,business_id,customer_id,sale_id,payment_id,created,kind,amount,balance_after,user_id,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(receivable['id'],b,receivable['customer_id'],sale['id'],result['id'],now(),'Abono',-val,balance,u['id'],clean(d.get('reference')),request))
                 result['receipt']='payment'
             elif action=='void_sale':
                 self.admin(u); s=self.scoped(db,'sales',d['sale_id'],b); c=self.cash(db,b)
@@ -563,10 +592,11 @@ class Store:
             debts=self.rows(db,"SELECT s.*,c.name customer,c.phone FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.debt>0 AND s.status='active' ORDER BY s.due,s.id",(b,))
             if u['role']!='admin':
                 for s in sales+debts: s.pop('cost',None)
-            result={'sales':sales,'debts':debts,'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,'SELECT l.*,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? ORDER BY l.id DESC',(b,)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
+            result={'sales':sales,'debts':debts,'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,'SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY l.id DESC',(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
             if u['role']=='admin':
                 result['stock_moves']=self.rows(db,'SELECT m.*,p.name,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? ORDER BY m.id DESC',(b,start,end))
                 result['payments']=self.rows(db,'SELECT method,kind,SUM(amount) amount FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ? GROUP BY method,kind',(b,start,end))
+                result['sale_payments']=self.rows(db,'SELECT sale_id,method,amount,kind FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ?',(b,start,end))
                 result['top']=self.rows(db,"SELECT l.product_id,l.name,l.unit,SUM(l.qty) qty,SUM(l.total) total,SUM(l.total-l.cost) margin FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' AND substr(s.created,1,10) BETWEEN ? AND ? GROUP BY l.product_id,l.name,l.unit ORDER BY total DESC",(b,start,end))
                 result['audit']=self.rows(db,'SELECT a.created,a.action,u.name operator,a.detail FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.business_id=? AND substr(a.created,1,10) BETWEEN ? AND ? ORDER BY a.id DESC LIMIT 500',(b,start,end))
                 result['cash_moves']=self.rows(db,'SELECT * FROM cash_moves WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ? ORDER BY id DESC',(b,start,end))
@@ -586,7 +616,7 @@ class Store:
             categories=self.rows(db,"SELECT COALESCE(NULLIF(p.category,''),'Sin categoría') category,SUM(l.total) sales,SUM(l.total-l.cost) margin FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id WHERE s.business_id=? AND s.status='active' AND substr(s.created,1,10) BETWEEN ? AND ? GROUP BY category ORDER BY sales DESC",args)
             payments=self.rows(db,"SELECT method,SUM(amount) amount FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ? GROUP BY method ORDER BY amount DESC",args)
             sellers=self.rows(db,"SELECT u.name seller,COUNT(*) transactions,SUM(s.total) sales,SUM(s.total-s.cost) margin FROM sales s JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND s.status='active' AND s.total>0 AND substr(s.created,1,10) BETWEEN ? AND ? GROUP BY s.user_id,u.name ORDER BY sales DESC",args)
-            rotation=self.rows(db,"""WITH sold AS (SELECT l.product_id,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-7 day') THEN l.qty ELSE 0 END) sold7,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-30 day') THEN l.qty ELSE 0 END) sold30,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-90 day') THEN l.qty ELSE 0 END) sold90,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-90 day') THEN l.total ELSE 0 END) revenue90 FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' GROUP BY l.product_id), ranked AS (SELECT p.id,p.name,p.sku,p.unit,p.min_stock,p.max_stock,p.reorder_point,p.lead_time_days,COALESCE(SUM(l.qty),0) stock,COALESCE(x.sold7,0) sold7,COALESCE(x.sold30,0) sold30,COALESCE(x.sold90,0) sold90,COALESCE(x.revenue90,0) revenue90 FROM products p LEFT JOIN lots l ON l.product_id=p.id LEFT JOIN sold x ON x.product_id=p.id WHERE p.business_id=? AND p.active=1 GROUP BY p.id) SELECT *,ROUND(sold30/30.0,2) daily_average,CASE WHEN sold30>0 THEN ROUND(stock/(sold30/30.0),1) ELSE NULL END days_stock,CASE WHEN sold30=0 THEN 0 ELSE MAX(0,COALESCE(NULLIF(max_stock,0),MAX(min_stock*2,reorder_point))-stock) END suggested_qty FROM ranked ORDER BY revenue90 DESC,name""",(b,b))
+            rotation=self.rows(db,"""WITH sold AS (SELECT l.product_id,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-7 day') THEN l.qty ELSE 0 END) sold7,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-30 day') THEN l.qty ELSE 0 END) sold30,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-90 day') THEN l.qty ELSE 0 END) sold90,SUM(CASE WHEN substr(s.created,1,10)>=date('now','-90 day') THEN l.total ELSE 0 END) revenue90 FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' GROUP BY l.product_id), ranked AS (SELECT p.id,p.name,p.sku,p.category,p.unit,p.min_stock,p.max_stock,p.reorder_point,p.lead_time_days,COALESCE(SUM(l.qty),0) stock,COALESCE(x.sold7,0) sold7,COALESCE(x.sold30,0) sold30,COALESCE(x.sold90,0) sold90,COALESCE(x.revenue90,0) revenue90 FROM products p LEFT JOIN lots l ON l.product_id=p.id LEFT JOIN sold x ON x.product_id=p.id WHERE p.business_id=? AND p.active=1 GROUP BY p.id) SELECT *,ROUND(sold30/30.0,2) daily_average,CASE WHEN sold30>0 THEN ROUND(stock/(sold30/30.0),1) ELSE NULL END days_stock,CASE WHEN sold30=0 THEN 0 ELSE MAX(0,COALESCE(NULLIF(max_stock,0),MAX(min_stock*2,reorder_point))-stock) END suggested_qty FROM ranked ORDER BY revenue90 DESC,name""",(b,b))
             total_revenue=sum(x['revenue90'] for x in rotation); cumulative=0
             for item in rotation:
                 cumulative+=item['revenue90']; ratio=cumulative/total_revenue if total_revenue else 1
@@ -634,7 +664,7 @@ class Store:
         if kind=='sale':
             data=self.scoped(db,'sales',id,b); data['lines']=self.rows(db,'SELECT * FROM sale_lines WHERE sale_id=?',(id,)); data['payments']=self.rows(db,'SELECT * FROM payments WHERE sale_id=? ORDER BY id',(id,)); data['own_total']=data['total']; data['total']+=data.get('dairy_total',0); data['title']='Recibo de venta'; data['code']=('MM' if b==1 else 'FE')+f"-{data['number']:06d}"
             for x in self.rows(db,'SELECT * FROM unregistered_sale_lines WHERE sale_id=? ORDER BY id',(id,)):
-                data['lines'].append({'name':x['description'],'sku':'NO-CATALOGADO','unit':x['unit'],'qty':x['qty'],'price':x['price'],'total':x['total'],'price_basis':1})
+                data['lines'].append({'name':x['description']+((f" · {x['note']}") if x['note'] else ''),'description':x['note'],'sku':'NO-CATALOGADO','unit':x['unit'],'qty':x['qty'],'price':x['price'],'total':x['total'],'price_basis':1})
             for x in self.rows(db,'SELECT l.*,p.name,p.unit FROM dairy_sale_lines l JOIN dairy_products p ON p.id=l.product_id WHERE l.sale_id=? ORDER BY l.id',(id,)):
                 data['lines'].append({'name':x['name'],'sku':'LACTEO-TERCERO','unit':x['unit'],'qty':x['qty'],'price':x['price'],'total':x['total'],'price_basis':1000})
             data['payments']+=self.rows(db,"SELECT id,sale_id,NULL cash_id,NULL user_id,created,method,amount,'Lácteo tercero' kind,'' reference FROM dairy_payments WHERE sale_id=? ORDER BY id",(id,))
@@ -780,7 +810,7 @@ class Handler(BaseHTTPRequestHandler):
             else: d={}
             if path=='/api/status' and not post:
                 with self.store.connect() as db: setup=not bool(db.execute('SELECT 1 FROM users WHERE active=1').fetchone())
-                return self.respond(200,{'setup':setup,'version':'3.3.4'})
+                return self.respond(200,{'setup':setup,'version':'3.3.6'})
             if path=='/api/setup' and post: return self.respond(200,self.store.setup(d))
             if path=='/api/login' and post:
                 key=self.client_address[0]; attempts=[x for x in self.attempts.get(key,[]) if x>time.time()-300]; require(len(attempts)<10,'Espere cinco minutos antes de intentar nuevamente'); attempts.append(time.time()); self.attempts[key]=attempts

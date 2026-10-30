@@ -9,7 +9,7 @@ export async function hardwareInvoiceData(db,b,id){
  check(b===2,'La factura tamaño carta está disponible únicamente en ferretería');
  const tx=new Transaction(db,0),business=await one(db,'SELECT * FROM businesses WHERE id=2'),sale=await tx.scoped('sales',id,2);
  sale.lines=await rows(db,'SELECT * FROM sale_lines WHERE sale_id=? ORDER BY id',[id]);
- for(const item of await rows(db,'SELECT * FROM unregistered_sale_lines WHERE sale_id=? ORDER BY id',[id]))sale.lines.push({name:item.description,description:'Concepto no registrado en inventario',sku:'NO-CATALOGADO',unit:item.unit,qty:item.qty,price:item.price,total:item.total,price_basis:1});
+ for(const item of await rows(db,'SELECT * FROM unregistered_sale_lines WHERE sale_id=? ORDER BY id',[id]))sale.lines.push({name:item.description+(item.note?` · ${item.note}`:''),description:item.note||'Concepto no registrado en inventario',sku:'NO-CATALOGADO',unit:item.unit,qty:item.qty,price:item.price,total:item.total,price_basis:1});
  sale.payments=await rows(db,"SELECT method,SUM(amount) amount FROM payments WHERE sale_id=? AND amount>0 GROUP BY method ORDER BY method",[id]);
  sale.customer=sale.customer_id?await tx.scoped('customers',sale.customer_id,2):null;
  sale.operator=(await one(db,'SELECT name FROM users WHERE id=?',[sale.user_id]))?.name||'';

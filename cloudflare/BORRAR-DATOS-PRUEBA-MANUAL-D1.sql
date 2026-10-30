@@ -54,6 +54,7 @@ DELETE FROM purchases;
 DELETE FROM document_emails;
 DELETE FROM email_queue;
 DELETE FROM unregistered_sale_lines;
+DELETE FROM unregistered_options;
 DELETE FROM payments;
 DELETE FROM sale_lines;
 DELETE FROM sales;
@@ -74,6 +75,17 @@ DELETE FROM products;
 DELETE FROM users;
 DELETE FROM dairy_products;
 
+CREATE TABLE IF NOT EXISTS catalog_epochs(
+  business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
+  epoch INTEGER NOT NULL DEFAULT 1,
+  changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO catalog_epochs(business_id,epoch)
+SELECT id,1 FROM businesses;
+UPDATE catalog_epochs
+SET epoch=epoch+1, changed_at=CURRENT_TIMESTAMP;
+DELETE FROM catalog_changes;
+
 
 INSERT INTO finance_settings(business_id,distribution_pct,reinvestment_pct)
 VALUES (1,3000,1700),(2,3000,1700);
@@ -89,6 +101,13 @@ INSERT INTO dairy_products(id,code,name,unit,price,active) VALUES
 (2,'QUESO','Queso campesino','libra',0,1);
 
 INSERT INTO label_settings(business_id) SELECT id FROM businesses;
+
+INSERT INTO unregistered_options(business_id,name,active)
+SELECT id,'OTROS',1 FROM businesses;
+INSERT INTO unregistered_options(business_id,name,active)
+SELECT id,'DULCES DETAL',1 FROM businesses;
+INSERT INTO unregistered_options(business_id,name,active)
+SELECT id,'PAPELERIA',1 FROM businesses;
 
 
 

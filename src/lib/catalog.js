@@ -7,13 +7,21 @@ async function persist(business,value){localWrite(business,value);try{const db=a
 const merge=(items,updates,deleted=[])=>{const map=new Map(items.map(x=>[x.id,x]));for(const id of deleted)map.delete(id);for(const item of updates)map.set(item.id,item);return [...map.values()].sort((a,b)=>a.name.localeCompare(b.name,'es',{sensitivity:'base'}));};
 export function cachedCatalog(business){return localRead(business)?.products||[];}
 export async function syncCatalog(business,request,{full=false}={}){
- let saved=await stored(business)||{products:[],after:0,cursor:0,baselineCursor:0,complete:false};
+ let saved=await stored(business)||{products:[],after:0,cursor:0,baselineCursor:0,complete:false,epoch:0};
+ const resetIfChanged=async page=>{
+  const epoch=Number(page.epoch||1);
+  if(Number(saved.epoch||0)===epoch)return false;
+  saved={products:[],after:0,cursor:0,baselineCursor:0,complete:false,epoch};
+  await persist(business,saved);
+  return true;
+ };
  try{
-  if(saved.complete&&saved.cursor>0){let page;do{page=await request(`/api/catalog?since=${saved.cursor}&limit=100`);saved={...saved,products:merge(saved.products,page.products,page.deleted),cursor:page.cursor,complete:true};await persist(business,saved);}while(page.has_more);return saved;}
+  if(saved.complete&&saved.cursor>0){let page;do{page=await request(`/api/catalog?since=${saved.cursor}&limit=100`);if(await resetIfChanged(page))return syncCatalog(business,request,{full});saved={...saved,epoch:Number(page.epoch||1),products:merge(saved.products,page.products,page.deleted),cursor:page.cursor,complete:true};await persist(business,saved);}while(page.has_more);return saved;}
   do{
    const after=Number(saved.after||0),limit=after?100:30,page=await request(`/api/catalog?after=${after}&limit=${limit}`);
+   if(await resetIfChanged(page))return syncCatalog(business,request,{full});
    const baselineCursor=Number(saved.baselineCursor||saved.cursor||page.cursor||0);
-   saved={...saved,products:merge(saved.products,page.products),after:page.after,baselineCursor,cursor:baselineCursor,complete:!page.has_more};
+   saved={...saved,epoch:Number(page.epoch||1),products:merge(saved.products,page.products),after:page.after,baselineCursor,cursor:baselineCursor,complete:!page.has_more};
    await persist(business,saved);
   }while(full&&!saved.complete);
   return saved;

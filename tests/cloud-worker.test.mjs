@@ -97,7 +97,7 @@ test("status solicita configuracion cuando D1 no tiene usuarios", async () => {
   const { env } = environment();
   const response = await worker.fetch(new Request("https://comercio.example/api/status"), env);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { setup: true, cloud: true, version: "3.3.4" });
+  assert.deepEqual(await response.json(), { setup: true, cloud: true, version: "3.3.6" });
 });
 
 test("el primer administrador se crea solamente con un PIN de cuatro numeros", async () => {

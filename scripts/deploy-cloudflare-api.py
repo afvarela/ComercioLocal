@@ -284,7 +284,7 @@ def verify_worker(token: str, config: dict):
     with urllib.request.urlopen(request, timeout=60) as response:
         content = response.read()
     for required in (
-        b"version:'3.3.4'",
+        b"version:'3.3.6'",
         b"typeof db.one==='function'",
         b"width=/width:72mm/.test(source)?38:28",
         b"s.created>=? AND s.created<?",

@@ -170,7 +170,8 @@ export default function App() {
     [parkedSales,setParkedSales]=useState(()=>{try{return JSON.parse(localStorage.getItem("pos-parked-sales-v1")||"[]")}catch{return []}});
   const requestId = useRef(uid()),
     toastTimer = useRef(null),
-    switchLock = useRef(false);
+    switchLock = useRef(false),
+    saleCommit = useRef(null);
   const admin = state?.user.role === "admin";
   useEffect(()=>localStorage.setItem("pos-parked-sales-v1",JSON.stringify(parkedSales)),[parkedSales]);
   function newSale() {
@@ -331,7 +332,7 @@ export default function App() {
     setModal({ type: "receipt", kind, id, message, auto, key: uid() });
   }
   function form(type, id, extra = {}) {
-    setModal({ type, id, ...extra, key: uid() });
+    setModal({ type, id, ...extra, key: uid(), requestId: uid() });
   }
   async function switchBusiness(b) {
     if (b === business || switchLock.current) return;
@@ -440,15 +441,22 @@ export default function App() {
       return;
     }
     if (type === "unregistered_product") {
-      const q=Number(d.qty), price=Math.round(Number(d.price)*100), total=q*price, description=String(d.description||"OTROS").trim().toUpperCase();
+      const options=(state.unregistered_options || []).filter(option=>option.active), selected=options.find(option=>option.id===Number(d.option_id));
+      const q=Number(d.qty), price=Math.round(Number(d.price)*100), total=q*price, description=selected?.name || String(d.option_id||"OTROS").trim().toUpperCase(), note=String(d.note||"").trim();
       if(!Number.isInteger(q)||q<1||price<1) throw Error("Revise la cantidad y el precio");
-      if(!unregisteredTypes.includes(description)) throw Error("Seleccione un tipo de producto válido");
-      setCart(c=>[...c,{id:`extra-${uid()}`,unregistered:true,name:description,qty:q,unit:"und",price,originalPrice:price,discount:0,total,price_basis:1,description:"Producto no registrado · no afecta inventario"}]);
+      if(options.length&&!selected) throw Error("Seleccione un tipo de producto válido");
+      if(!options.length&&!unregisteredTypes.includes(description)) throw Error("Seleccione un tipo de producto válido");
+      setCart(c=>[...c,{id:`extra-${uid()}`,unregistered:true,option_id:selected?.id||null,name:description,note,qty:q,unit:"und",price,originalPrice:price,discount:0,total,price_basis:1,description:note||"Producto no registrado · no afecta inventario"}]);
       requestId.current=uid(); close(); return;
     }
     let payload = { ...d };
-    if (type === "product") payload = { ...d, id, perishable: !!d.perishable };
+    if (type === "product") payload = { ...d, id, perishable: !!d.perishable, active: id ? !!d.active : true };
     if (type === "customer") payload = { ...d, id };
+    if (type === "unregistered_option") payload = { ...d, id, active: id ? !!d.active : true };
+    if (type === "customer_payment") {
+      const allocations=Object.entries(d).filter(([key,value])=>key.startsWith("invoice_")&&Number(value)>0).map(([key,value])=>({sale_id:Number(key.slice(8)),amount:Number(value)}));
+      payload={customer_id:Number(d.customer_id),amount:allocations.length?allocations.reduce((sum,item)=>sum+item.amount,0):Number(d.amount),method:d.method,reference:d.reference,allocations,request_id:modal.requestId};
+    }
     if (type === "waste") payload.lot_id = id;
     if (type === "repay" || type === "email" || type === "void_sale")
       payload.sale_id = id;
@@ -456,8 +464,8 @@ export default function App() {
     if (type === "void_purchase") payload.purchase_id = id;
     if (type === "purchase_return") payload.purchase_line_id = id;
     if (type === "sale_return") payload.sale_id = id;
-    if (["repay", "purchase_return", "manual_purchase_return", "sale_return"].includes(type))
-      payload.request_id = uid();
+    if (["repay", "customer_payment", "purchase_return", "manual_purchase_return", "sale_return"].includes(type))
+      payload.request_id = modal.requestId;
     if (type === "quote")
       payload = {
         ...d,
@@ -510,6 +518,8 @@ export default function App() {
     }
   }
   async function saveSale(payload) {
+    if (saleCommit.current) return saleCommit.current;
+    const operation = (async () => {
     const shouldPrint = payload._print_receipt !== false;
     delete payload._print_receipt;
     const saleCart = cart.map((item) => ({ ...item }));
@@ -550,6 +560,13 @@ export default function App() {
       (r.offline ? "Venta local guardada" : "Venta guardada") +
       ". No se imprimió: " + error.message + ". Puedes reimprimirla desde Ventas.",
     ));
+    })();
+    saleCommit.current = operation;
+    try {
+      return await operation;
+    } finally {
+      saleCommit.current = null;
+    }
   }
   async function dates(a, z) {
     try {
@@ -597,6 +614,12 @@ export default function App() {
         case "business_settings":
           form("settings");
           break;
+        case "new_unregistered_option":
+          form("unregistered_option");
+          break;
+        case "edit_unregistered_option":
+          form("unregistered_option", id);
+          break;
         case "new_user":
           form("user");
           break;
@@ -632,7 +655,7 @@ export default function App() {
           }
           const q = await api(business, "/api/quote?id=" + id);
           const lines = q.lines.map((l) => {
-            if(l.unregistered) return {id:`extra-${uid()}`,unregistered:true,name:l.name||l.description||"OTROS",qty:l.qty,unit:"und",price:l.price,originalPrice:l.price,discount:0,total:l.total,price_basis:1,description:"Producto no registrado · no afecta inventario"};
+            if(l.unregistered) return {id:`extra-${uid()}`,unregistered:true,option_id:l.option_id||null,name:l.name||l.description||"OTROS",note:l.note||"",qty:l.qty,unit:"und",price:l.price,originalPrice:l.price,discount:0,total:l.total,price_basis:1,description:l.note||"Producto no registrado · no afecta inventario"};
             const p = state.products.find((p) => p.id === l.product_id);
             if (!p)
               throw Error("La cotización contiene un producto no disponible");

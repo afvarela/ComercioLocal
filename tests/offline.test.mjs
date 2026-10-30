@@ -69,6 +69,18 @@ test("las ventas offline sobreviven y descuentan la existencia proyectada", asyn
   assert.equal(stateAfterReload.products[0].available, 8);
 });
 
+test("repetir la misma venta offline no duplica cola ni inventario", async () => {
+  const sale = {
+    action: "sale",
+    data: { request_id: "offline-request-123456", lines: [{ product_id: 3, qty: 2 }] },
+  };
+  const repeated = await api(1, "/api/command", sale);
+  assert.equal(repeated.duplicate, true);
+  assert.equal(pendingSales().filter(item => item.requestId === "offline-request-123456").length, 1);
+  const stateAfterRepeat = await api(1, "/api/state");
+  assert.equal(stateAfterRepeat.products[0].available, 8);
+});
+
 test("no permite vender offline mas unidades que las guardadas", async () => {
   await assert.rejects(
     api(1, "/api/command", {

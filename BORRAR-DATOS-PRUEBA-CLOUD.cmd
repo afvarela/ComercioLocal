@@ -4,7 +4,8 @@ cd /d "%~dp0"
 echo.
 echo PELIGRO: este proceso borrara usuarios, ventas, inventario, clientes,
 echo despachos y movimientos de la base PUBLICADA en Cloudflare D1.
-echo Se exportara un respaldo antes de borrar.
+echo NO se creara respaldo ni se exportara D1.
+echo La estructura y los datos legales de los negocios se conservaran.
 echo.
 set /p CONFIRMACION=Escriba exactamente BORRAR PRODUCCION para continuar: 
 if not "%CONFIRMACION%"=="BORRAR PRODUCCION" (

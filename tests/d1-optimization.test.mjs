@@ -29,6 +29,52 @@ test("el navegador guarda el catálogo en IndexedDB y pagina de 30 en 30", () =>
   assert.match(catalog, /while\(full&&!saved\.complete\)/);
   assert.match(catalog, /since=\$\{saved\.cursor\}/);
   assert.match(catalog, /page\.deleted/);
+  assert.match(catalog, /resetIfChanged/);
+  assert.match(catalog, /page\.epoch/);
+});
+
+test("un reinicio completo invalida el catálogo guardado en cada navegador", () => {
+  const migration = read("cloudflare/migrations/0015_catalog_epoch.sql");
+  const reset = read("cloudflare/reset-test-data.sql");
+  const endpoint = read("cloudflare/read.mjs");
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS catalog_epochs/);
+  assert.match(reset, /UPDATE catalog_epochs/);
+  assert.match(reset, /DELETE FROM catalog_changes/);
+  assert.match(endpoint, /SELECT epoch FROM catalog_epochs/);
+  assert.match(endpoint, /mode:'full',epoch/);
+  assert.match(endpoint, /mode:'incremental',epoch/);
+});
+
+test("un cambio de versión reemplaza los productos guardados en IndexedDB", async () => {
+  const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const indexedDbDescriptor = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  const memory = new Map();
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+      getItem: key => memory.get(key) ?? null,
+      setItem: (key, value) => memory.set(key, String(value)),
+  }});
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined });
+  try {
+    localStorage.setItem("pos-catalog-snapshot-v1", JSON.stringify({
+      1: { epoch: 4, products: [{ id: 900, name: "Producto eliminado" }], after: 900, cursor: 70, complete: true },
+    }));
+    const calls = [];
+    const request = async path => {
+      calls.push(path);
+      if (path.includes("since=")) return { epoch: 5, products: [], deleted: [], cursor: 70, has_more: false };
+      return { epoch: 5, products: [{ id: 1, name: "Papa común" }], deleted: [], after: 1, cursor: 80, has_more: false };
+    };
+    const { syncCatalog } = await import("../src/lib/catalog.js");
+    const result = await syncCatalog(1, request);
+    assert.deepEqual(result.products.map(product => product.name), ["Papa común"]);
+    assert.ok(calls.some(path => path.includes("since=70")));
+    assert.ok(calls.some(path => path.includes("after=0")));
+  } finally {
+    if (storageDescriptor) Object.defineProperty(globalThis, "localStorage", storageDescriptor);
+    else delete globalThis.localStorage;
+    if (indexedDbDescriptor) Object.defineProperty(globalThis, "indexedDB", indexedDbDescriptor);
+    else delete globalThis.indexedDB;
+  }
 });
 
 test("el POS no solicita historial ni lotes completos en cada venta", () => {
