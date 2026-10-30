@@ -1,0 +1,24 @@
+IMPORTACION DE INVENTARIO - TIENDA EL DESCANSO
+
+Deje en esta carpeta el archivo con este nombre exacto:
+
+  INVENTARIO TIENDA EL DESCANSO.xlsx
+
+La hoja que se importa se debe llamar "Productos" y sus primeras cinco columnas
+deben conservar este orden:
+
+  Nombre del Producto | UM | Precio de venta | costo | inventario
+
+Las celdas vacias de precio, costo o inventario se importan con valor cero.
+Las demas hojas del libro no se importan; por eso la ferreteria no se mezcla con
+el supermercado.
+
+Para importar:
+
+  - Base local: ejecute IMPORTAR-INVENTARIO-LOCAL.cmd
+  - Cloudflare D1: ejecute IMPORTAR-INVENTARIO-CLOUD.cmd
+
+El proceso crea un respaldo antes de modificar la base. Al repetirlo reemplaza
+solamente los articulos de esta importacion (SKU TDESC-). Si esos articulos ya
+tienen ventas, el proceso se detiene para proteger el historial; en ese caso debe
+reiniciar primero los datos de prueba y crear nuevamente el administrador.

@@ -20,6 +20,7 @@ backups/
 *.sqlite3
 *.sqlite3-*
 cloudflare/local-data.sql
+importaciones/*.xlsx
 
 # Archivos temporales y perfiles de navegador
 tmp/

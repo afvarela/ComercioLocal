@@ -1,6 +1,6 @@
 """Comercio Local: local-only POS, Python 3.11+, no external dependencies."""
 from __future__ import annotations
-import argparse, csv, hashlib, hmac, html, io, json, os, re, secrets, smtplib, sqlite3, ssl, textwrap, time
+import argparse, csv, hashlib, hmac, html, io, json, os, re, secrets, smtplib, sqlite3, ssl, textwrap, time, unicodedata
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from email.message import EmailMessage
@@ -97,6 +97,31 @@ class Store:
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
         with self.connect() as db:
             db.executescript((ROOT/'schema.sql').read_text('utf-8'))
+            db.execute("CREATE TABLE IF NOT EXISTS app_migrations(name TEXT PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            if not db.execute("SELECT 1 FROM app_migrations WHERE name='0013_clean_product_search'").fetchone():
+                # Rebuild only the derived search index. Excel traceability stays
+                # in products.description but no longer pollutes commercial search.
+                db.execute('DROP TRIGGER IF EXISTS product_search_insert')
+                db.execute('DROP TRIGGER IF EXISTS product_search_update')
+                db.execute('DELETE FROM product_search')
+                db.execute("""INSERT INTO product_search(rowid,business_id,product_id,searchable)
+                    SELECT p.id,p.business_id,p.id,
+                      trim(COALESCE(p.name,'') || ' ' || COALESCE(p.sku,'') || ' ' || COALESCE(p.barcode,'') || ' ' ||
+                        CASE WHEN lower(trim(COALESCE(p.description,''))) LIKE 'importado desde excel,%' THEN '' ELSE COALESCE(p.description,'') END || ' ' ||
+                        COALESCE(p.category,''))
+                    FROM products p WHERE p.active=1""")
+                db.executescript("""
+                    CREATE TRIGGER product_search_insert AFTER INSERT ON products WHEN NEW.active=1 BEGIN
+                      INSERT INTO product_search(rowid,business_id,product_id,searchable)
+                      VALUES(NEW.id,NEW.business_id,NEW.id,trim(COALESCE(NEW.name,'') || ' ' || COALESCE(NEW.sku,'') || ' ' || COALESCE(NEW.barcode,'') || ' ' || CASE WHEN lower(trim(COALESCE(NEW.description,''))) LIKE 'importado desde excel,%' THEN '' ELSE COALESCE(NEW.description,'') END || ' ' || COALESCE(NEW.category,'')));
+                    END;
+                    CREATE TRIGGER product_search_update AFTER UPDATE OF business_id,sku,barcode,name,description,category,active ON products BEGIN
+                      DELETE FROM product_search WHERE rowid=OLD.id;
+                      INSERT INTO product_search(rowid,business_id,product_id,searchable)
+                      SELECT NEW.id,NEW.business_id,NEW.id,trim(COALESCE(NEW.name,'') || ' ' || COALESCE(NEW.sku,'') || ' ' || COALESCE(NEW.barcode,'') || ' ' || CASE WHEN lower(trim(COALESCE(NEW.description,''))) LIKE 'importado desde excel,%' THEN '' ELSE COALESCE(NEW.description,'') END || ' ' || COALESCE(NEW.category,'')) WHERE NEW.active=1;
+                    END;
+                """)
+                db.execute("INSERT INTO app_migrations(name) VALUES('0013_clean_product_search')")
             db.execute('PRAGMA journal_mode=WAL')
             # Additive migrations preserve all existing prices, quantities and sales.
             for table,column,definition in [('products','price_basis','INTEGER NOT NULL DEFAULT 1000'),('products','image','TEXT NOT NULL DEFAULT \'\''),('lots','cost_basis','INTEGER NOT NULL DEFAULT 1000'),('sale_lines','price_basis','INTEGER NOT NULL DEFAULT 1000')]:
@@ -195,17 +220,47 @@ class Store:
     def user(self,token):
         with self.connect() as db:
             return self.one(db,'SELECT u.id,u.username,u.name,u.role,u.businesses FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>? AND u.active=1',(token,int(time.time())))
-    def state(self,u,b):
+    def catalog(self,b,after=0,since=0,limit=30):
+        limit=max(1,min(100,int(limit or 30))); after=max(0,int(after or 0)); since=max(0,int(since or 0))
         with self.connect() as db:
-            products=self.rows(db,"""SELECT p.*, COALESCE((SELECT SUM(qty) FROM lots WHERE product_id=p.id),0) stock,
-              COALESCE((SELECT SUM(qty) FROM lots WHERE product_id=p.id AND (expires IS NULL OR expires>=?)),0) available
-              FROM products p WHERE p.business_id=? AND p.active=1 ORDER BY p.name""",(today(),b))
-            lots=self.rows(db,'SELECT l.*,p.name,p.unit FROM lots l JOIN products p ON p.id=l.product_id WHERE l.business_id=? AND l.qty>0 ORDER BY COALESCE(l.expires,\'9999\'),l.id',(b,))
+            def product_rows(ids):
+                if not ids: return []
+                marks=','.join('?' for _ in ids)
+                return self.rows(db,f'''SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available FROM products p LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id WHERE p.business_id=? AND p.active=1 AND p.id IN ({marks}) GROUP BY p.id ORDER BY p.name''',(today(),b,*ids))
+            if since:
+                changes=self.rows(db,'SELECT id,product_id FROM catalog_changes WHERE business_id=? AND id>? ORDER BY id LIMIT ?',(b,since,limit)); ids=list(dict.fromkeys(x['product_id'] for x in changes)); products=product_rows(ids); active={x['id'] for x in products}
+                return {'mode':'incremental','products':products,'deleted':[x for x in ids if x not in active],'cursor':changes[-1]['id'] if changes else since,'has_more':len(changes)==limit}
+            products=self.rows(db,'''WITH page AS (SELECT * FROM products WHERE business_id=? AND active=1 AND id>? ORDER BY id LIMIT ?) SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available FROM page p LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id GROUP BY p.id ORDER BY p.id''',(b,after,limit,today()))
+            latest=self.one(db,'SELECT id FROM catalog_changes WHERE business_id=? ORDER BY id DESC LIMIT 1',(b,))
+            return {'mode':'full','products':products,'deleted':[],'after':products[-1]['id'] if products else after,'cursor':latest['id'] if latest else 0,'has_more':len(products)==limit}
+    def product_search(self,b,value,limit=90,exact=False):
+        raw=str(value or '').strip()[:120]; limit=max(1,min(90,int(limit or 90)))
+        if not raw: return {'products':[]}
+        select='''SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available FROM products p LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id'''
+        with self.connect() as db:
+            if exact:
+                products=self.rows(db,select+''' WHERE p.business_id=? AND p.active=1 AND (p.barcode=? OR p.sku=?) GROUP BY p.id ORDER BY p.name LIMIT ?''',(today(),b,raw,raw,limit))
+                return {'products':products}
+            normalized=''.join(char for char in unicodedata.normalize('NFD',raw.lower()) if unicodedata.category(char)!='Mn')
+            terms=[term for term in re.sub(r'[^a-z0-9]+',' ',normalized).split() if term]
+            if not terms: return {'products':[]}
+            if all(len(term)>=3 for term in terms):
+                match=' AND '.join('"'+term.replace('"','""')+'"' for term in terms)
+                products=self.rows(db,'''WITH matches AS (SELECT product_id,rank FROM product_search WHERE product_search MATCH ? AND business_id=? ORDER BY rank LIMIT ?) SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available,MIN(m.rank) search_rank FROM matches m JOIN products p ON p.id=m.product_id LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id WHERE p.business_id=? AND p.active=1 GROUP BY p.id ORDER BY search_rank,p.name LIMIT ?''',(match,b,limit,today(),b,limit))
+                return {'products':products}
+            escaped=raw.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+            products=self.rows(db,select+''' WHERE p.business_id=? AND p.active=1 AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.barcode LIKE ? ESCAPE '\\') GROUP BY p.id ORDER BY p.name LIMIT ?''',(today(),b,escaped,escaped,escaped,limit))
+            return {'products':products}
+    def state(self,u,b,include_catalog=True,details=True,include_customers=True):
+        with self.connect() as db:
+            products=self.rows(db,'''SELECT p.*,COALESCE(SUM(l.qty),0) stock,COALESCE(SUM(CASE WHEN l.expires IS NULL OR l.expires>=? THEN l.qty ELSE 0 END),0) available FROM products p LEFT JOIN lots l ON l.product_id=p.id AND l.business_id=p.business_id WHERE p.business_id=? AND p.active=1 GROUP BY p.id ORDER BY p.name''',(today(),b)) if include_catalog else []
+            lots=self.rows(db,'SELECT l.*,p.name,p.unit FROM lots l JOIN products p ON p.id=l.product_id WHERE l.business_id=? AND l.qty>0 ORDER BY COALESCE(l.expires,\'9999\'),l.id',(b,)) if details else []
             if u['role']!='admin':
                 for l in lots: l.pop('cost',None)
             c=self.one(db,'SELECT c.*,u.name operator FROM cash_sessions c JOIN users u ON u.id=c.user_id WHERE c.business_id=? AND c.closed IS NULL',(b,))
             if c: c['expected']=self.expected(db,c)
-            return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'lots':lots,'customers':self.rows(db,'SELECT c.*,COALESCE((SELECT SUM(debt) FROM sales WHERE customer_id=c.id AND status=\'active\'),0) balance,COALESCE((SELECT SUM(total) FROM sales WHERE customer_id=c.id AND status=\'active\'),0) total_purchases,COALESCE((SELECT COUNT(*) FROM sales WHERE customer_id=c.id AND status=\'active\'),0) purchase_count FROM customers c WHERE business_id=? ORDER BY name',(b,)),'cash':c,'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
+            customers=self.rows(db,"SELECT c.*,COALESCE(s.balance,0) balance,COALESCE(s.total_purchases,0) total_purchases,COALESCE(s.purchase_count,0) purchase_count FROM customers c LEFT JOIN (SELECT customer_id,SUM(debt) balance,SUM(total) total_purchases,COUNT(*) purchase_count FROM sales WHERE business_id=? AND status='active' GROUP BY customer_id) s ON s.customer_id=c.id WHERE c.business_id=? ORDER BY c.name",(b,b)) if include_customers else []
+            return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'lots':lots,'customers':customers,'cash':c,'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
     def lines(self,db,b,raw,stock=True):
         require(isinstance(raw,list) and 0<len(raw)<=300,'Agregue productos a la venta')
         combined={}
@@ -331,8 +386,8 @@ class Store:
             elif action=='quote':
                 require(b==2,'Las cotizaciones están disponibles en ferretería'); raw=d.get('lines') or []; lines=self.lines(db,b,raw,False) if raw else []
                 for item in d.get('unregistered_lines') or []:
-                    q=quantity(item.get('qty',1),'und'); price=money(item.get('price')); require(q>0 and price>0,'Revise el producto no registrado de la cotización')
-                    lines.append({'product_id':None,'unregistered':True,'name':'Producto no registrado','description':'Concepto sin control de inventario','sku':'NO-CATALOGADO','unit':'und','qty':q,'price':price,'price_basis':1,'total':q*price,'cost':0,'allocations':[]})
+                    q=quantity(item.get('qty',1),'und'); price=money(item.get('price')); description=clean(item.get('description')) or 'OTROS'; require(q>0 and price>0,'Revise el producto no registrado de la cotización')
+                    lines.append({'product_id':None,'unregistered':True,'name':description,'description':'Concepto sin control de inventario','sku':'NO-CATALOGADO','unit':'und','qty':q,'price':price,'price_basis':1,'total':q*price,'cost':0,'allocations':[]})
                 require(lines,'Agregue productos a la cotización'); cid=d.get('customer_id') or None
                 if cid: self.scoped(db,'customers',cid,b)
                 valid=iso(d.get('valid_until')); require(valid>=today(),'La vigencia no puede estar en el pasado')
@@ -725,7 +780,7 @@ class Handler(BaseHTTPRequestHandler):
             else: d={}
             if path=='/api/status' and not post:
                 with self.store.connect() as db: setup=not bool(db.execute('SELECT 1 FROM users WHERE active=1').fetchone())
-                return self.respond(200,{'setup':setup,'version':'3.3.2'})
+                return self.respond(200,{'setup':setup,'version':'3.3.4'})
             if path=='/api/setup' and post: return self.respond(200,self.store.setup(d))
             if path=='/api/login' and post:
                 key=self.client_address[0]; attempts=[x for x in self.attempts.get(key,[]) if x>time.time()-300]; require(len(attempts)<10,'Espere cinco minutos antes de intentar nuevamente'); attempts.append(time.time()); self.attempts[key]=attempts
@@ -737,7 +792,9 @@ class Handler(BaseHTTPRequestHandler):
                     with self.store.connect() as db: db.execute('DELETE FROM sessions WHERE token=?',(token,))
                     return self.respond(200,{'ok':True},headers={'Set-Cookie':'pos_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
                 allowed=json.loads(u['businesses']); b=int(q.get('business',[allowed[0]])[0]); require(b in allowed,'No tiene acceso a este negocio')
-                if path=='/api/state' and not post: return self.respond(200,self.store.state(u,b))
+                if path=='/api/state' and not post: return self.respond(200,self.store.state(u,b,q.get('catalog',['1'])[0]!='0',q.get('details',['1'])[0]!='0',q.get('customers',['1'])[0]!='0'))
+                if path=='/api/catalog' and not post: return self.respond(200,self.store.catalog(b,q.get('after',[0])[0],q.get('since',[0])[0],q.get('limit',[30])[0]))
+                if path=='/api/product-search' and not post: return self.respond(200,self.store.product_search(b,q.get('q',[''])[0],q.get('limit',[90])[0],q.get('exact',['0'])[0]=='1'))
                 if path=='/api/logistics' and not post: return self.respond(200,logistics_state(self.store,u,b,q.get('search',[''])[0]))
                 if path=='/api/dispatch-sale' and not post: return self.respond(200,sale_options(self.store,u,b,int(q['id'][0])))
                 if path=='/api/logistics-command' and post: return self.respond(200,logistics_command(self.store,u,b,d['action'],d.get('data',{})))

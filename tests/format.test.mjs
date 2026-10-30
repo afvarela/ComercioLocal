@@ -6,6 +6,7 @@ import {
   productNeedsWeight,
   automaticProductQuantity,
   unregisteredLinePayload,
+  unregisteredTypes,
 } from "../src/lib/format.js";
 
 test("dos litros a 4000 cuestan 8000", () => {
@@ -52,4 +53,16 @@ test("un producto sin registrar conserva su precio al enviarse a la venta", () =
     discount: 0,
   });
   assert.equal(cartTotal([line]), 800000);
+});
+
+test("producto no registrado usa únicamente el listado fijo solicitado", () => {
+  assert.deepEqual(unregisteredTypes, ["OTROS", "DULCES DETAL", "PAPELERIA"]);
+  const payload = unregisteredLinePayload({
+    unregistered: true,
+    name: "DULCES DETAL",
+    qty: 1,
+    originalPrice: 250000,
+    discount: 0,
+  });
+  assert.equal(payload.description, "DULCES DETAL");
 });

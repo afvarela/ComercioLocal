@@ -84,3 +84,77 @@ CREATE TABLE IF NOT EXISTS dispatch_lines(id INTEGER PRIMARY KEY,dispatch_id INT
 CREATE TABLE IF NOT EXISTS dispatch_history(id INTEGER PRIMARY KEY,dispatch_id INTEGER NOT NULL REFERENCES dispatches(id),created TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id),from_status TEXT NOT NULL DEFAULT '',to_status TEXT NOT NULL,note TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS label_settings(business_id INTEGER PRIMARY KEY REFERENCES businesses(id),format TEXT NOT NULL DEFAULT 'large',width_mm INTEGER NOT NULL DEFAULT 72,height_mm INTEGER NOT NULL DEFAULT 45,margin_mm INTEGER NOT NULL DEFAULT 2,name_size INTEGER NOT NULL DEFAULT 12,price_size INTEGER NOT NULL DEFAULT 22,barcode_height INTEGER NOT NULL DEFAULT 18,gap_mm INTEGER NOT NULL DEFAULT 2,updated_by INTEGER REFERENCES users(id),updated_at TEXT);
 INSERT OR IGNORE INTO label_settings(business_id) SELECT id FROM businesses;
+
+-- Catálogo incremental e índices para reducir lecturas D1.
+-- Migración aditiva: no elimina ni reescribe productos, ventas o inventario.
+CREATE TABLE IF NOT EXISTS catalog_changes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  business_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_changes_business_id ON catalog_changes(business_id,id);
+CREATE INDEX IF NOT EXISTS idx_products_catalog_page ON products(business_id,active,id);
+CREATE INDEX IF NOT EXISTS idx_products_name ON products(business_id,active,name COLLATE NOCASE,id);
+CREATE INDEX IF NOT EXISTS idx_products_category_name ON products(business_id,active,category,name,id);
+CREATE INDEX IF NOT EXISTS idx_lots_product_available ON lots(business_id,product_id,expires,qty);
+CREATE INDEX IF NOT EXISTS idx_sales_customer_status ON sales(customer_id,status);
+CREATE INDEX IF NOT EXISTS idx_payments_sale ON payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_lines_sale ON sale_lines(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_lines_product ON sale_lines(product_id,sale_id);
+CREATE INDEX IF NOT EXISTS idx_cash_moves_cash ON cash_moves(cash_id);
+CREATE INDEX IF NOT EXISTS idx_quotes_business_id ON quotes(business_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_dairy_payments_sale ON dairy_payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_payments_business_date ON payments(business_id,created);
+CREATE INDEX IF NOT EXISTS idx_cash_moves_business_date ON cash_moves(business_id,created);
+CREATE INDEX IF NOT EXISTS idx_audit_business_date ON audit(business_id,created);
+CREATE INDEX IF NOT EXISTS idx_receivable_moves_business_date ON receivable_moves(business_id,created);
+
+INSERT INTO catalog_changes(business_id,product_id)
+SELECT p.business_id,p.id FROM products p WHERE NOT EXISTS(SELECT 1 FROM catalog_changes);
+CREATE TRIGGER IF NOT EXISTS catalog_products_insert AFTER INSERT ON products BEGIN
+  INSERT INTO catalog_changes(business_id,product_id) VALUES(NEW.business_id,NEW.id);
+END;
+CREATE TRIGGER IF NOT EXISTS catalog_products_update AFTER UPDATE ON products BEGIN
+  INSERT INTO catalog_changes(business_id,product_id) VALUES(NEW.business_id,NEW.id);
+END;
+CREATE TRIGGER IF NOT EXISTS catalog_products_delete AFTER DELETE ON products BEGIN
+  INSERT INTO catalog_changes(business_id,product_id) VALUES(OLD.business_id,OLD.id);
+END;
+CREATE TRIGGER IF NOT EXISTS catalog_lots_insert AFTER INSERT ON lots BEGIN
+  INSERT INTO catalog_changes(business_id,product_id) VALUES(NEW.business_id,NEW.product_id);
+END;
+CREATE TRIGGER IF NOT EXISTS catalog_lots_update AFTER UPDATE ON lots BEGIN
+  INSERT INTO catalog_changes(business_id,product_id) VALUES(NEW.business_id,NEW.product_id);
+END;
+CREATE TRIGGER IF NOT EXISTS catalog_lots_delete AFTER DELETE ON lots BEGIN
+  INSERT INTO catalog_changes(business_id,product_id) VALUES(OLD.business_id,OLD.product_id);
+END;
+
+-- Índice de búsqueda parcial para nombre, referencia, código y descripción.
+CREATE VIRTUAL TABLE IF NOT EXISTS product_search USING fts5(
+  business_id UNINDEXED,
+  product_id UNINDEXED,
+  searchable,
+  tokenize='trigram remove_diacritics 1'
+);
+INSERT INTO product_search(rowid,business_id,product_id,searchable)
+SELECT p.id,p.business_id,p.id,
+  trim(COALESCE(p.name,'') || ' ' || COALESCE(p.sku,'') || ' ' ||
+       COALESCE(p.barcode,'') || ' ' ||
+       CASE WHEN lower(trim(COALESCE(p.description,''))) LIKE 'importado desde excel,%' THEN '' ELSE COALESCE(p.description,'') END || ' ' ||
+       COALESCE(p.category,''))
+FROM products p
+WHERE NOT EXISTS(SELECT 1 FROM product_search s WHERE s.rowid=p.id);
+CREATE TRIGGER IF NOT EXISTS product_search_insert AFTER INSERT ON products WHEN NEW.active=1 BEGIN
+  INSERT INTO product_search(rowid,business_id,product_id,searchable)
+  VALUES(NEW.id,NEW.business_id,NEW.id,trim(COALESCE(NEW.name,'') || ' ' || COALESCE(NEW.sku,'') || ' ' || COALESCE(NEW.barcode,'') || ' ' || CASE WHEN lower(trim(COALESCE(NEW.description,''))) LIKE 'importado desde excel,%' THEN '' ELSE COALESCE(NEW.description,'') END || ' ' || COALESCE(NEW.category,'')));
+END;
+CREATE TRIGGER IF NOT EXISTS product_search_update AFTER UPDATE OF business_id,sku,barcode,name,description,category,active ON products BEGIN
+  DELETE FROM product_search WHERE rowid=OLD.id;
+  INSERT INTO product_search(rowid,business_id,product_id,searchable)
+  SELECT NEW.id,NEW.business_id,NEW.id,trim(COALESCE(NEW.name,'') || ' ' || COALESCE(NEW.sku,'') || ' ' || COALESCE(NEW.barcode,'') || ' ' || CASE WHEN lower(trim(COALESCE(NEW.description,''))) LIKE 'importado desde excel,%' THEN '' ELSE COALESCE(NEW.description,'') END || ' ' || COALESCE(NEW.category,'')) WHERE NEW.active=1;
+END;
+CREATE TRIGGER IF NOT EXISTS product_search_delete AFTER DELETE ON products BEGIN
+  DELETE FROM product_search WHERE rowid=OLD.id;
+END;

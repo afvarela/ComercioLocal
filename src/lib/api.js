@@ -1,3 +1,4 @@
+import { cachedCatalog, syncCatalog as syncCatalogStore } from "./catalog.js";
 const CACHE = "pos-api-cache-v2";
 const QUEUE = "pos-offline-sales-v2";
 const AUTH = "pos-offline-auth-v1";
@@ -7,6 +8,7 @@ const read = (key, fallback) => {
 };
 const write = (key, value) => localStorage.setItem(key, JSON.stringify(value));
 const cacheKey = (business, path) => `${business}:${path}`;
+const isStatePath = path => path.split("?")[0] === "/api/state";
 const offlineAction = (path, data) => path === "/api/command" ? data?.action : path === "/api/logistics-command" && data?.action === "status" ? "logistics_status" : "";
 const isOfflineSale = (path, data) => offlineAction(path, data) === "sale" && data?.data?.request_id;
 const isOfflineOperation = (path, data) => ["sale", "open_cash", "logistics_status"].includes(offlineAction(path, data));
@@ -43,7 +45,7 @@ function latestCached(cache, business, path) {
   return latest ? cache[latest] : undefined;
 }
 
-function projectedState(value, business) {
+export function projectOfflineState(value, business) {
   if (!value?.products) return value;
   const state = structuredClone(value);
   for (const sale of pendingSales().filter((item) => item.business === business)) {
@@ -105,9 +107,10 @@ function projectedHistory(value, business) {
 
 function validateOfflineStock(business, data) {
   const cache = read(CACHE, {});
-  const base = cache[cacheKey(business, "/api/state")];
+  const base = structuredClone(cache[cacheKey(business, "/api/state")] || {});
+  if (!base.products?.length) base.products = cachedCatalog(business);
   if (!base?.products) return;
-  const state = projectedState(base, business);
+  const state = projectOfflineState(base, business);
   for (const line of data.data.lines || []) {
     const product = state.products.find((item) => item.id === Number(line.product_id));
     if (!product) throw Error("El producto no está disponible en la copia sin conexión");
@@ -136,11 +139,11 @@ function enqueueOperation(business, path, data, reason) {
       note: data.data.note || "Apertura guardada sin conexión",
       offline: true,
     };
-    cache[key] = state;
+    for (const cacheName of Object.keys(cache).filter(name => name.startsWith(`${business}:/api/state`))) cache[cacheName] = structuredClone(state);
     write(CACHE, cache);
   }
   if (action === "logistics_status") {
-    const cache = read(CACHE, {}), key = cacheKey(business, "/api/logistics"), logistics = cache[key];
+    const cache = read(CACHE, {}), key = Object.keys(cache).find(name => name.startsWith(`${business}:/api/logistics`)) || cacheKey(business, "/api/logistics"), logistics = cache[key];
     const dispatch = logistics?.dispatches?.find((item) => item.id === Number(data.data.id));
     if (!dispatch) throw Error("El despacho no está disponible en la copia sin conexión");
     dispatch.status = data.data.status;
@@ -179,6 +182,14 @@ async function request(business, path, data) {
   return result;
 }
 
+export async function syncProductCatalog(business, options = {}) {
+  return syncCatalogStore(business, path => request(business, path), options);
+}
+export async function searchProducts(business, query, { exact = false, limit = 90 } = {}) {
+  const params = new URLSearchParams({ q: String(query || ""), limit: String(limit) });
+  if (exact) params.set("exact", "1");
+  return request(business, `/api/product-search?${params}`);
+}
 export async function api(business, path, data) {
   if (path === "/api/login" && data && !navigator.onLine) return offlineLogin(data);
   if (path === "/api/logout" && data && !navigator.onLine) {
@@ -192,8 +203,9 @@ export async function api(business, path, data) {
     if (data === undefined) {
       const cache = read(CACHE, {});
       cache[cacheKey(business, path)] = result;
+      if (isStatePath(path)) cache[cacheKey(business, "/api/state")] = result;
       write(CACHE, cache);
-      if (path === "/api/state") localStorage.setItem(LOCAL_SESSION, "1");
+      if (isStatePath(path)) localStorage.setItem(LOCAL_SESSION, "1");
     }
     return result;
   } catch (error) {
@@ -203,15 +215,15 @@ export async function api(business, path, data) {
       return { ok: true, offline: true };
     }
     if (isOfflineOperation(path, data) && (!navigator.onLine || !error.status)) return enqueueOperation(business, path, data, error.message);
-    if (data === undefined && (!navigator.onLine || !error.status)) {
+    if (data === undefined && (!navigator.onLine || !error.status || error.status === 503)) {
       const cached = latestCached(read(CACHE, {}), business, path);
       if (cached !== undefined) {
-        if (path === "/api/state" && localStorage.getItem(LOCAL_SESSION) !== "1") {
+        if (isStatePath(path) && localStorage.getItem(LOCAL_SESSION) !== "1") {
           const denied = Error("Inicia sesión con tu usuario y PIN para trabajar sin internet");
           denied.status = 401;
           throw denied;
         }
-        if (path === "/api/state") return projectedState(cached, business);
+        if (isStatePath(path)) return { ...projectOfflineState(cached, business), degraded: error.status === 503 };
         if (path.startsWith("/api/history?")) return projectedHistory(cached, business);
         return cached;
       }

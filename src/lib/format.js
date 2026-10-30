@@ -5,6 +5,7 @@ export const methods = [
   "Bancolombia",
   "Datáfono",
 ];
+export const unregisteredTypes = ["OTROS", "DULCES DETAL", "PAPELERIA"];
 export const cop = (x) =>
   new Intl.NumberFormat("es-CO", {
     style: "currency",

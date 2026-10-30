@@ -30,6 +30,8 @@ for (let attempt = 1; attempt <= 12; attempt += 1) {
     if (!html.includes("/app.js")) throw new Error("La pagina principal no carga app.js");
     if (!bundle.includes("PIN de acceso") || !bundle.includes("[0-9]{4}"))
       throw new Error("El archivo publicado no contiene el PIN numerico de cuatro digitos");
+    for (const marker of ["/api/product-search", "comercio-catalog-v1", "catalog=0", "since="])
+      if (!bundle.includes(marker)) throw new Error(`app.js no contiene la optimizacion D1: ${marker}`);
     if (/\bproduction\s*===/.test(bundle))
       throw new Error("React fue compilado con una variable production invalida");
     if (/cache\.put\([^;]+response\.clone\(\)/.test(serviceWorker))

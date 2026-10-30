@@ -1,6 +1,6 @@
 ﻿import {randomBytes,createHash} from 'node:crypto';
-import {rows,one,check,clean,admin,passwordHash,passwordCheck,command,Transaction,today} from './store.mjs';
-import {state,history,analytics,inventoryReport,reportRows,receipt,receiptText} from './read.mjs';
+import {rows,one,check,clean,admin,passwordHash,passwordCheck,command,Transaction,today,instrumentDatabase} from './store.mjs';
+import {state,catalog,productSearch,history,analytics,inventoryReport,reportRows,receipt,receiptText} from './read.mjs';
 import {inventoryXlsx,reportXlsx} from './xlsx.mjs';
 import {financeState,financeCommand,financePermission} from './finance.mjs';
 import {dairyState,dairyCommand,dairyPermission} from './dairy.mjs';
@@ -11,10 +11,12 @@ function json(data,status=200,extra={}){return new Response(JSON.stringify(data)
 const hash=v=>createHash('sha256').update(v).digest('hex');
 const epoch=()=>Math.floor(Date.now()/1000);
 export default {async fetch(request,env){
+ let metrics;
  try{
  const url=new URL(request.url),path=url.pathname,q=url.searchParams,post=request.method==='POST';
+ metrics=instrumentDatabase(env.DB,path,env.D1_METRICS==='1');env={...env,DB:metrics.db};
  if(!['GET','POST','HEAD'].includes(request.method))return json({error:'Método no permitido'},405);
- if(path==='/api/status')return json({setup:!(await one(env.DB,'SELECT 1 present FROM users WHERE active=1 LIMIT 1')),cloud:true,version:'3.3.2'});
+ if(path==='/api/status')return json({setup:!(await one(env.DB,'SELECT 1 present FROM users WHERE active=1 LIMIT 1')),cloud:true,version:'3.3.4'});
  if(path.startsWith('/images/')){check(/^\/images\/[a-z0-9-]+\.(jpg|jpeg|png|webp|svg)$/.test(path),'Imagen invalida');const name=path.slice('/images/'.length),object=await env.IMAGES.get('products/'+name);if(!object)return env.ASSETS.fetch(request);const h=new Headers(headers);object.writeHttpMetadata(h);const extension=name.split('.').pop(),types={jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',webp:'image/webp',svg:'image/svg+xml; charset=utf-8'};h.set('Content-Type',types[extension]);h.set('ETag',object.httpEtag);h.set('Cache-Control','public,max-age=86400');return new Response(object.body,{headers:h});}
  if(!post&&!path.startsWith('/api/')&&!['/receipt','/receipt.txt','/invoice','/invoice.pdf','/dispatch','/dispatch.txt'].includes(path))return env.ASSETS.fetch(request);
  let d={};if(post){check(request.headers.get('X-POS-Request')==='1','Solicitud no autorizada');check(request.headers.get('Origin')===url.origin,'Origen no permitido');const text=await request.text();check(text.length<=1048576,'Solicitud demasiado grande');d=JSON.parse(text);}
@@ -43,8 +45,10 @@ export default {async fetch(request,env){
  const {password,password_version,...u}=user;
  if(path==='/api/logout'&&post){await env.DB.prepare('DELETE FROM cloud_sessions WHERE token=?').bind(hash(token)).run();return json({ok:true},200,{'Set-Cookie':'pos_cloud=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0'});}
  const allowed=JSON.parse(u.businesses),b=Number(q.get('business')||allowed[0]);check(allowed.includes(b),'No tiene acceso a este negocio');
- if(path==='/api/state'&&!post)return json(await state(env.DB,u,b));
- if(path==='/api/logistics'&&!post)return json(await logisticsState(env.DB,u,b,q.get('search')||''));
+ if(path==='/api/state'&&!post)return json(await state(env.DB,u,b,{includeCatalog:q.get('catalog')!=='0',details:q.get('details')!=='0',includeCustomers:q.get('customers')!=='0'}));
+ if(path==='/api/catalog'&&!post)return json(await catalog(env.DB,b,{after:q.get('after'),since:q.get('since'),limit:q.get('limit')}));
+ if(path==='/api/product-search'&&!post)return json(await productSearch(env.DB,b,q.get('q'),{limit:q.get('limit'),exact:q.get('exact')==='1'}));
+ if(path==='/api/logistics'&&!post)return json(await logisticsState(env.DB,u,b,q.get('search')||'',q.get('products')!=='0'));
  if(path==='/api/dispatch-sale'&&!post)return json(await saleOptions(env.DB,u,b,Number(q.get('id'))));
  if(path==='/api/logistics-command'&&post)return json(await logisticsCommand(env.DB,u,b,d.action,d.data||{}));
  if(path==='/api/history'&&!post)return json(await history(env.DB,u,b,q.get('start')||today(),q.get('end')||today()));
@@ -70,5 +74,6 @@ export default {async fetch(request,env){
  if(path==='/api/export'&&!post){admin(u);const kind=q.get('kind');check(['sales','stock_moves','payments','top','debts','cash_moves','audit'].includes(kind),'Reporte inválido');const data=(await history(env.DB,u,b,q.get('start')||today(),q.get('end')||today()))[kind];const safe=v=>'"'+String(typeof v==='string'&&/^[=+\-@\t\r]/.test(v)?"'"+v:v??'').replaceAll('"','""')+'"';const csv=data.length?[Object.keys(data[0]),...data.map(Object.values)].map(r=>r.map(safe).join(';')).join('\r\n'):'';return new Response('\ufeff'+csv,{headers:{...headers,'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="${kind}-${b}.csv"`}});}
  if(path==='/api/backup'&&!post){admin(u);const tables=['businesses','users','products','lots','customers','cash_sessions','quotes','sales','sale_lines','payments','cash_moves','stock_moves','audit','email_queue','finance_permissions','finance_settings','finance_accounts','finance_movements','finance_invoices','finance_invoice_payments','finance_employees','finance_payrolls','finance_payroll_payments','finance_profits','finance_beneficiaries','finance_profit_payouts','finance_reinvestment_uses','finance_reconciliations'];const result=await env.DB.batch(tables.map(t=>env.DB.prepare(`SELECT * FROM ${t}`)));return json({format:'comercio-d1-v2',created:new Date().toISOString(),tables:Object.fromEntries(tables.map((t,i)=>[t,result[i].results]))},200,{'Content-Disposition':'attachment; filename="comercio-d1-backup.json"'});}
  return json({error:'Ruta no encontrada'},404);
- }catch(e){const message=String(e.message||e);if(/D1_|SQLITE|constraint|database/i.test(message)){console.error(JSON.stringify({type:'database_error',message}));return json({error:/UNIQUE/.test(message)?'Referencia duplicada o transacción ya registrada':'No se pudo confirmar la operación. Reintente; las ventas conservan su identificador.'},409);}return json({error:message},400);}
+ }catch(e){const message=String(e.message||e);if(/free tier daily row read limit/i.test(message)){console.error(JSON.stringify({type:'d1_daily_limit',message}));return json({error:'Cloudflare D1 alcanzó el límite diario de lecturas. La aplicación usará temporalmente los datos guardados en este equipo.'},503);}if(/D1_|SQLITE|constraint|database/i.test(message)){console.error(JSON.stringify({type:'database_error',message}));return json({error:/UNIQUE/.test(message)?'Referencia duplicada o transacción ya registrada':'No se pudo confirmar la operación. Reintente; las ventas conservan su identificador.'},409);}return json({error:message},400);}
+finally{metrics?.flush();}
 }};

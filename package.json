@@ -8,7 +8,7 @@
     "start": "node scripts/start.mjs",
     "build": "node build.mjs",
     "dev": "node build.mjs --watch",
-    "test": "node --test --test-isolation=none tests/payments.test.mjs tests/customers.test.mjs tests/cloud-worker.test.mjs tests/logistics-cloud.test.mjs tests/offline.test.mjs tests/format.test.mjs"
+    "test": "node --test --test-isolation=none tests/payments.test.mjs tests/customers.test.mjs tests/cloud-worker.test.mjs tests/logistics-cloud.test.mjs tests/offline.test.mjs tests/format.test.mjs tests/product-search.test.mjs tests/d1-optimization.test.mjs tests/pos-regression.test.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",

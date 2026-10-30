@@ -10,34 +10,40 @@ import {
   localDate,
   saleNumber,
   normalize,
+  unregisteredTypes,
 } from "../lib/format.js";
 export default function OperationForm({
   config,
   state,
-  history,
+  history = {},
   business,
   admin,
   onClose,
   onSubmit,
 }) {
   const { type, id } = config;
-  const product = state.products.find((p) => p.id === id) || {},
-    customer = state.customers.find((c) => c.id === id) || {},
-    lot = state.lots.find((l) => l.id === id) || {},
-    sale = history.debts.find((s) => s.id === id) || {},
-    editedUser = (history.users || []).find((x) => x.id === id) || {},
-    b = state.businesses.find((b) => b.id === business);
+  const safeHistory = history || {},
+    products = state.products || [],
+    customers = state.customers || [],
+    lots = state.lots || [],
+    businesses = state.businesses || [],
+    product = products.find((p) => p.id === id) || {},
+    customer = customers.find((c) => c.id === id) || {},
+    lot = lots.find((l) => l.id === id) || {},
+    sale = (safeHistory.debts || []).find((s) => s.id === id) || {},
+    editedUser = (safeHistory.users || []).find((x) => x.id === id) || {},
+    b = businesses.find((item) => item.id === business);
   const [unit, setUnit] = useState(product.unit || "und");
   const [basis, setBasis] = useState(product.price_basis || 500);
   const [selectedProduct, setSelectedProduct] = useState(
-    type === "receive" ? "" : state.products[0]?.id || "",
+    type === "receive" ? "" : products[0]?.id || "",
   );
   const [receiveSearch, setReceiveSearch] = useState("");
   const returnLines = config.sale?.lines ||
-    (history.sale_lines || []).filter((line) => Number(line.sale_id) === Number(id));
+    (safeHistory.sale_lines || []).filter((line) => Number(line.sale_id) === Number(id));
   const [selectedSaleLine, setSelectedSaleLine] = useState(returnLines[0]?.id || "");
   const returnLine = returnLines.find((line) => Number(line.id) === Number(selectedSaleLine));
-  const receiving = state.products.find(
+  const receiving = products.find(
     (p) => p.id === Number(selectedProduct),
   );
   const receivingVegetable = business === 1 && receiving?.category === "Verduras";
@@ -304,14 +310,14 @@ export default function OperationForm({
       );
       break;
     case "void_purchase": {
-      const purchase = history.purchases.find((p) => p.id === id);
+      const purchase = (safeHistory.purchases || []).find((p) => p.id === id);
       title = `Anular compra COMP-${String(purchase?.number || 0).padStart(6, "0")}`;
       submit = "Confirmar anulación";
       body = <><Notice>Solo se anulará si toda la mercancía pendiente de esa compra continúa disponible.</Notice><Field name="reason" label="Motivo de la anulación" required /></>;
       break;
     }
     case "purchase_return": {
-      const line = history.purchase_lines.find((l) => l.id === id);
+      const line = (safeHistory.purchase_lines || []).find((l) => l.id === id);
       title = "Devolución de compra";
       submit = "Registrar devolución";
       body = <><p>{line?.name} · COMP-{String(line?.purchase_number || 0).padStart(6, "0")}</p><Field name="qty" label={`Cantidad en ${line?.unit || "unidades"}`} type="number" min="1" max={(line?.qty || 0)-(line?.returned_qty || 0)} required /><Field name="reason" label="Motivo" required /><Field name="note" label="Observaciones" /></>;
@@ -411,7 +417,7 @@ export default function OperationForm({
     case "unregistered_product":
       title = "Producto no registrado";
       submit = "Agregar a la venta";
-      body = <><Notice info>Este ítem aparecerá como Producto no registrado y no descontará inventario.</Notice><Field name="qty" label="Cantidad" type="number" min="1" step="1" defaultValue="1" required/><MoneyField name="price" label="Precio a facturar por unidad" defaultValue="0"/></>;
+      body = <><Notice info>Este ítem no descontará inventario.</Notice><Select name="description" label="Tipo de producto" defaultValue="OTROS">{unregisteredTypes.map((type)=><option key={type} value={type}>{type}</option>)}</Select><Field name="qty" label="Cantidad" type="number" min="1" step="1" defaultValue="1" required/><MoneyField name="price" label="Precio a facturar por unidad" defaultValue="0"/></>;
       break;
     case "cash_move":
       title = "Entrada o retiro de efectivo";
@@ -521,9 +527,9 @@ export default function OperationForm({
           <Select name="role" label="Rol" defaultValue={editedUser.role||"cashier"}><option value="cashier">Cajero</option><option value="admin">Administrador</option></Select>
           <Select name="access" label="Negocios autorizados" defaultValue={editedUser.businesses?(JSON.parse(editedUser.businesses).length===2?"both":String(JSON.parse(editedUser.businesses)[0])):"both"}><option value="both">Ambos negocios</option><option value="1">Solo mini market</option><option value="2">Solo ferreter?a</option></Select>
           <h3>Permisos de Contabilidad por negocio</h3>
-          {[1,2].map((businessId)=><fieldset className="finance-permissions" key={businessId}><legend>{businessId===1?"Mini market":"Ferretería"}</legend>{[["view","Ver"],["create","Crear"],["edit","Editar"],["void","Anular"],["authorize","Aprobar pagos y retiros"],["export","Exportar informaci?n"]].map(([key,label])=><label className="check" key={key}><input type="checkbox" name={`finance_${businessId}_${key}`} defaultChecked={Boolean((history.finance_permissions||[]).find(x=>x.user_id===id&&x.business_id===businessId)?.[`can_${key}`])}/>{label}</label>)}</fieldset>)}
+          {[1,2].map((businessId)=><fieldset className="finance-permissions" key={businessId}><legend>{businessId===1?"Mini market":"Ferretería"}</legend>{[["view","Ver"],["create","Crear"],["edit","Editar"],["void","Anular"],["authorize","Aprobar pagos y retiros"],["export","Exportar informaci?n"]].map(([key,label])=><label className="check" key={key}><input type="checkbox" name={`finance_${businessId}_${key}`} defaultChecked={Boolean((safeHistory.finance_permissions||[]).find(x=>x.user_id===id&&x.business_id===businessId)?.[`can_${key}`])}/>{label}</label>)}</fieldset>)}
           <h3>Permisos de Lácteos caseros</h3>
-          <fieldset className="finance-permissions"><legend>Recaudo de terceros</legend>{[["view","Consultar módulo"],["price","Modificar precios"],["void","Anular o devolver"],["close","Realizar cuadre diario"],["reopen","Reabrir días cerrados"]].map(([key,label])=><label className="check" key={key}><input type="checkbox" name={`dairy_${key}`} defaultChecked={Boolean((history.dairy_permissions||[]).find(x=>x.user_id===id)?.[`can_${key}`])}/>{label}</label>)}</fieldset>
+          <fieldset className="finance-permissions"><legend>Recaudo de terceros</legend>{[["view","Consultar módulo"],["price","Modificar precios"],["void","Anular o devolver"],["close","Realizar cuadre diario"],["reopen","Reabrir días cerrados"]].map(([key,label])=><label className="check" key={key}><input type="checkbox" name={`dairy_${key}`} defaultChecked={Boolean((safeHistory.dairy_permissions||[]).find(x=>x.user_id===id)?.[`can_${key}`])}/>{label}</label>)}</fieldset>
           {id&&<label className="check"><input type="checkbox" name="active" defaultChecked={Boolean(editedUser.active)}/>Usuario activo</label>}
         </>
       );
@@ -560,7 +566,7 @@ export default function OperationForm({
     case "email": {
       title = "Enviar recibo por correo";
       submit = "Agregar a la cola";
-      const sale = history.sales.find((s) => s.id === id),
+      const sale = (safeHistory.sales || []).find((s) => s.id === id),
         client = state.customers.find((c) => c.id === sale?.customer_id);
       body = (
         <>
@@ -582,7 +588,7 @@ export default function OperationForm({
     case "quote_email": {
       title = "Enviar cotización por correo";
       submit = "Agregar a la cola";
-      const quote = history.quotes.find((q) => q.id === id);
+      const quote = (safeHistory.quotes || []).find((q) => q.id === id);
       body = (
         <>
           <Field

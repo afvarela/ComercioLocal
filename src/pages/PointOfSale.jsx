@@ -6,9 +6,10 @@ import {
   base,
   lineTotal,
   cartTotal,
-  normalize,
 } from "../lib/format.js";
 import { filterCustomers } from "../lib/customers.js";
+import { matchesProductSearch } from "../lib/productSearch.js";
+import { useProductSearch } from "../lib/useProductSearch.js";
 export default function PointOfSale({
   business,
   state,
@@ -55,7 +56,7 @@ export default function PointOfSale({
       if (event.key === "F8" && cart.length) {
         event.preventDefault();
         const index = cartHighlight >= 0 ? cartHighlight : cart.length - 1;
-        onProduct(cart[index].id, index);
+        onProduct(cart[index].id, index, undefined, { product: cart[index] });
       }
     }
     document.addEventListener("keydown", shortcuts);
@@ -64,37 +65,54 @@ export default function PointOfSale({
   useEffect(() => {
     cartRefs.current[cartHighlight]?.scrollIntoView({ block: "nearest" });
   }, [cartHighlight]);
+  const productSearch = useProductSearch(business, state.products, search, 90);
   const results = useMemo(() => {
-    const terms = normalize(search).split(/\s+/).filter(Boolean);
-    return state.products.filter(
+    const searching = Boolean(search.trim());
+    return (searching ? productSearch.products : state.products).filter(
       (p) =>
-        (!category || p.category === category) &&
-        terms.every((t) =>
-          normalize(
-            [p.name, p.sku, p.barcode, p.description].join(" "),
-          ).includes(t),
-        ),
+        (searching || !category || p.category === category) &&
+        matchesProductSearch(p, search),
     );
-  }, [state.products, search, category]);
+  }, [state.products, productSearch.products, search, category]);
+  const dairyResults = useMemo(
+    () =>
+      vegetables
+        ? []
+        : (state.dairy_products || []).filter((product) =>
+            matchesProductSearch(
+              {
+                ...product,
+                sku: "LÁCTEO-" + product.id,
+                category: "Lácteos caseros",
+                description: "Dinero de terceros",
+              },
+              search,
+            ),
+          ),
+    [state.dairy_products, search, vegetables],
+  );
   const categories = [
     ...new Set(state.products.map((p) => p.category).filter(Boolean)),
   ];
   const customerResults = filterCustomers(state.customers, customerSearch);
-  function add(id, index, scanned = false) {
+  function add(id, index, scanned = false, product = null) {
     onProduct(id, index, () => {
       setSearch("");
       setHighlight(0);
       input.current?.focus();
-    }, { scanned });
+    }, { scanned, product });
   }
-  function key(e) {
+  async function key(e) {
     if (e.key === "Enter") {
       e.preventDefault();
-      const exact = state.products.find(
+      let exact = state.products.find(
         (p) => p.barcode === search.trim() || p.sku === search.trim(),
       );
+      if (!exact && /^[0-9]{6,}$/.test(search.trim())) {
+        try { exact = await productSearch.exact(search.trim()); } catch {}
+      }
       const p = exact || results[highlight];
-      if (p) add(p.id, undefined, Boolean(exact?.barcode && exact.barcode === search.trim()));
+      if (p) add(p.id, undefined, Boolean(exact?.barcode && exact.barcode === search.trim()), p);
     } else if (["ArrowUp", "ArrowDown"].includes(e.key)) {
       e.preventDefault();
       if (!search && cart.length) {
@@ -110,7 +128,7 @@ export default function PointOfSale({
     }
   }
   function chooseProduct(product) {
-    if (product.price) add(product.id);
+    if (product.price) add(product.id, undefined, false, product);
     else onAction(state.user.role === "admin" ? "edit_product" : "price_required", product.id);
   }
   function changeMarketView(view) {
@@ -135,7 +153,7 @@ export default function PointOfSale({
               <label htmlFor="hardware-search">Buscar producto</label>
               <div className="searchbox">
                 <span className="search-icon">⌕</span>
-                <input id="hardware-search" ref={input} value={search} onChange={(event) => { setSearch(event.target.value); setHighlight(0); }} onKeyDown={key} placeholder="Escribe nombre, referencia o descripción…" autoComplete="off" />
+                <input id="hardware-search" ref={input} value={search} onChange={(event) => { setSearch(event.target.value); if (event.target.value.trim()) setCategory(""); setHighlight(0); }} onKeyDown={key} placeholder="Escribe nombre, referencia o descripción…" autoComplete="off" />
               </div>
               <div className="search-hint"><span><kbd className="key">Enter</kbd> Agregar · <kbd className="key">↑ ↓</kbd> Seleccionar</span><span>{results.length} resultado(s)</span></div>
             </div>
@@ -165,7 +183,7 @@ export default function PointOfSale({
                     <td>{index + 1}</td>
                     <td>{line.sku || (line.unregistered ? "NO REGISTRADO" : "—")}</td>
                     <td><b>{line.name}</b></td>
-                    <td className="number"><button type="button" className="quantity-cell" disabled={line.unregistered} onClick={() => !line.unregistered && add(line.id, index)}>{stockLabel(line.qty, line.unit)} ✎</button></td>
+                    <td className="number"><button type="button" className="quantity-cell" disabled={line.unregistered} onClick={() => !line.unregistered && add(line.id, index, false, line)}>{stockLabel(line.qty, line.unit)} ✎</button></td>
                     <td>{base(line.unit, line.price_basis)}</td>
                     <td className="number">{cop(line.price)}</td>
                     <td className="number subtotal-cell">{cop(lineTotal(line))}</td>
@@ -229,6 +247,7 @@ export default function PointOfSale({
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
+                if (e.target.value.trim()) setCategory("");
                 setHighlight(0);
               }}
               onKeyDown={key}
@@ -244,9 +263,9 @@ export default function PointOfSale({
           <div className="search-hint">
             <span>
               <kbd className="key">Enter</kbd> Seleccionar ·{" "}
-              <kbd className="key">↑ ↓</kbd> Mover selección
+              <kbd className="key">↑ ↓</kbd> Mover selección · Usa fragmentos como <kbd className="key">SHA* ORI*</kbd>
             </span>
-            <span>{state.products.length} productos</span>
+            <span>{search.trim() ? results.length + dairyResults.length : state.products.length + dairyResults.length} producto(s)</span>
           </div>
           <div className="category-row">
             {business === 1 && (
@@ -294,7 +313,7 @@ export default function PointOfSale({
               <table className="hardware-table market-products-table">
                 <thead><tr><th></th><th>Producto</th><th>Referencia</th><th>Categoría</th><th>Disponible</th><th className="number">Precio</th><th></th></tr></thead>
                 <tbody>
-                  {!vegetables && state.dairy_products?.map((product) => <tr key={`dairy-${product.id}`} className="dairy-row" onClick={() => product.price ? add(`dairy-${product.id}`) : onAction("dairy_price", product.id)}>
+                  {dairyResults.map((product) => <tr key={`dairy-${product.id}`} className="dairy-row" onClick={() => product.price ? add(`dairy-${product.id}`) : onAction("dairy_price", product.id)}>
                     <td><span className="market-row-icon">L</span></td><td><b>{product.name}</b><small>Dinero de terceros</small></td><td>LÁCTEO-{product.id}</td><td>Lácteos caseros</td><td>Sin inventario</td><td className="number"><b>{product.price ? cop(product.price) : "Sin precio"}</b><small>/{product.unit}</small></td><td><button type="button" className="table-add">{product.price ? "Agregar" : "Precio"}</button></td>
                   </tr>)}
                   {results.slice(0, 90).map((product, index) => <tr key={product.id} className={index === highlight ? "highlight" : ""} onClick={() => chooseProduct(product)}>
@@ -302,13 +321,13 @@ export default function PointOfSale({
                     <td><b>{product.name}</b><small>{product.description || "Sin descripción"}</small></td>
                     <td>{product.sku}</td><td>{product.category || "Sin categoría"}</td><td className={product.available <= product.min_stock ? "warn-text" : ""}>{stockLabel(product.available, product.unit)}</td><td className="number"><b>{product.price ? cop(product.price) : "Sin precio"}</b><small>/{base(product.unit, product.price_basis)}</small></td><td><button type="button" className="table-add">{product.price ? "Agregar" : "Precio"}</button></td>
                   </tr>)}
-                  {!results.length && (vegetables || !state.dairy_products?.length) && <tr><td colSpan="7" className="hardware-empty">No encontramos productos con esa búsqueda.</td></tr>}
+                  {!results.length && !dairyResults.length && <tr><td colSpan="7" className="hardware-empty">No encontramos productos con esa búsqueda.</td></tr>}
                 </tbody>
               </table>
             </div>
           ) : (
           <div className="products">
-            {business===1&&!vegetables&&state.dairy_products?.map((p)=><button key={`dairy-${p.id}`} className="product-card dairy-card" onClick={()=>p.price?add(`dairy-${p.id}`):onAction("dairy_price",p.id)}><span className="category">LÁCTEOS CASEROS</span><span className="name">{p.name}</span><span className="description">Sin inventario · dinero de terceros</span><span className="price">{p.price?cop(p.price):"Configurar precio"}<small> / {p.unit}</small></span><span className="plus">+</span></button>)}
+            {business===1&&!vegetables&&dairyResults.map((p)=><button key={`dairy-${p.id}`} className="product-card dairy-card" onClick={()=>p.price?add(`dairy-${p.id}`):onAction("dairy_price",p.id)}><span className="category">LÁCTEOS CASEROS</span><span className="name">{p.name}</span><span className="description">Sin inventario · dinero de terceros</span><span className="price">{p.price?cop(p.price):"Configurar precio"}<small> / {p.unit}</small></span><span className="plus">+</span></button>)}
             {results.length ? (
               results.slice(0, 90).map((p, i) => (
                 <button
@@ -316,7 +335,7 @@ export default function PointOfSale({
                   className={`product-card ${p.image ? "has-image" : ""} tone-${i % 4} ${i === highlight ? "highlight" : ""}`}
                   onClick={() =>
                     p.price
-                      ? add(p.id)
+                      ? add(p.id, undefined, false, p)
                       : onAction(
                           state.user.role === "admin"
                             ? "edit_product"
@@ -348,7 +367,7 @@ export default function PointOfSale({
                   <span className="plus">+</span>
                 </button>
               ))
-            ) : (
+            ) : !dairyResults.length && (
               <div className="panel empty" style={{ gridColumn: "1/-1" }}>
                 <div className="empty-icon">▦</div>
                 <strong>
@@ -396,7 +415,7 @@ export default function PointOfSale({
                     <span>{cop(lineTotal(l))}</span>
                   </div>
                   <div className="cart-line-foot">
-                    <button disabled={l.unregistered} onClick={() => !l.unregistered&&add(l.id, i)}>
+                    <button disabled={l.unregistered} onClick={() => !l.unregistered&&add(l.id, i, false, l)}>
                       {stockLabel(l.qty, l.unit)} ✎
                     </button>
                     <span>

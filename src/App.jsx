@@ -1,16 +1,19 @@
 import React, { useEffect, useRef, useState } from "react";
-import { api, downloadInvoicePdf, pendingSales, syncPendingSales } from "./lib/api.js";
+import { api, downloadInvoicePdf, pendingSales, syncPendingSales, syncProductCatalog, projectOfflineState } from "./lib/api.js";
 import { printReceipt, printOfflineSale } from "./lib/printer.js";
 import {
   cop,
   cartTotal,
   qty,
+  stockLabel,
   localDate,
   uid,
   productNeedsWeight,
   automaticProductQuantity,
   unregisteredLinePayload,
+  unregisteredTypes,
 } from "./lib/format.js";
+import { validateInventoryQuantity } from "./lib/cartInventory.js";
 import { Button, Field, Badge } from "./components/UI.jsx";
 import PointOfSale from "./pages/PointOfSale.jsx";
 import Accounting from "./pages/Accounting.jsx";
@@ -156,7 +159,7 @@ export default function App() {
     [quoteId, setQuoteId] = useState(null),
     [customerId, setCustomerId] = useState(""),
     [modal, setModal] = useState(null),
-    [message, setMessage] = useState(""),
+    [message, setMessage] = useState(null),
     [start, setStart] = useState(localDate()),
     [end, setEnd] = useState(localDate()),
     [focusKey, setFocusKey] = useState(0),
@@ -180,28 +183,44 @@ export default function App() {
     if(cart.length)next.push({id:uid(),business,cart,customerId,quoteId,requestId:requestId.current,created:new Date().toISOString()});
     setParkedSales(next);setCart(selected.cart);setCustomerId(selected.customerId||"");setQuoteId(selected.quoteId||null);requestId.current=selected.requestId||uid();setView("pos");setFocusKey(x=>x+1);toast("Venta en espera recuperada");
   }
-  function toast(text) {
-    setMessage(text);
+  function toast(text, tone = "info", duration = 6500) {
+    setMessage({ text: String(text), tone });
     clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setMessage(""), 6500);
+    toastTimer.current = setTimeout(() => setMessage(null), duration);
   }
-  async function refresh(b = business, a = start, z = end) {
-    const [s, h] = await Promise.all([
-      api(b, "/api/state"),
-      api(b, `/api/history?start=${a}&end=${z}`),
+  function inventoryMessage(product, validation) {
+    const available = Number.isFinite(validation.available)
+      ? stockLabel(Math.max(0, validation.available), product.unit)
+      : "sin información";
+    return `No se puede agregar ${product.name}: inventario insuficiente. Disponible: ${available}.`;
+  }
+  function rejectInventory(product, validation) {
+    const text = inventoryMessage(product, validation);
+    toast(text, "error", 4000);
+    setFocusKey((value) => value + 1);
+    return text;
+  }
+  async function refresh(b = business, a = start, z = end, options = {}) {
+    const loadHistory = options.history ?? !["pos", "vegetables", "dispatches", "labels", "accounting", "dairy"].includes(view);
+    const details = options.details ?? view === "inventory";
+    const customers = options.customers ?? (!state || b !== business || ["customers", "guarantors"].includes(view));
+    const [base, catalog] = await Promise.all([
+      api(b, `/api/state?catalog=0&details=${details ? 1 : 0}&customers=${customers ? 1 : 0}`),
+      syncProductCatalog(b, { full: details }),
     ]);
-    setState(s);
-    setHistory(h);
-    return s;
+    const merged = projectOfflineState({ ...base, products: catalog.products, customers: customers ? base.customers : (b === business ? state?.customers || [] : []), degraded: base.degraded || catalog.offline }, b);
+    setState(merged);
+    if (loadHistory) setHistory(await api(b, `/api/history?start=${a}&end=${z}`));
+    return merged;
   }
   async function navigate(id) {
     setView(id);
-    if (id !== "pos") return;
-    setFocusKey((value) => value + 1);
+    if (["dispatches", "labels", "accounting", "dairy"].includes(id)) return;
+    if (id === "pos" || id === "vegetables") setFocusKey((value) => value + 1);
     setSwitching(true);
     try {
-      await refresh();
-      toast("Punto de venta actualizado con las existencias más recientes");
+      await refresh(business, start, end, { history: !["pos", "vegetables"].includes(id), details: id === "inventory", customers: ["customers", "guarantors"].includes(id) });
+      if (id === "pos") toast("Punto de venta actualizado con las existencias más recientes");
     } catch (error) {
       toast(error.message);
     } finally {
@@ -267,7 +286,7 @@ export default function App() {
     function key(e) {
       if (!state || modal) return;
       if(e.key==="F1"){e.preventDefault();newSale();return;}
-      if(e.key==="F5"){e.preventDefault();setView("guarantors");return;}
+      if(e.key==="F5"){e.preventDefault();navigate("guarantors");return;}
       if (e.key === "F2") {
         e.preventDefault();
         setView("pos");
@@ -342,7 +361,7 @@ export default function App() {
   function addProduct(id, index, after, options = {}) {
     const dairyId=String(id).startsWith("dairy-")?Number(String(id).slice(6)):null;
     const source=dairyId?state.dairy_products.find(x=>x.id===dairyId):null;
-    const p=source?{...source,id:`dairy-${source.id}`,dairy:true,dairy_product_id:source.id,sku:source.code,description:"Recaudo por cuenta de terceros",price_basis:1000,available:Infinity}:state.products.find((x) => x.id === id);
+    const p=source?{...source,id:`dairy-${source.id}`,dairy:true,dairy_product_id:source.id,sku:source.code,description:"Recaudo por cuenta de terceros",price_basis:1000,available:Infinity}:options.product || state.products.find((x) => x.id === id);
     if (!p) return;
     if (p.price <= 0) {
       toast(p.dairy?"Un usuario autorizado debe configurar el precio en Control de lácteos":"Asigna un precio a este producto en Inventario antes de venderlo");
@@ -350,6 +369,12 @@ export default function App() {
     }
     if (index == null && !productNeedsWeight(p)) {
       const amount = automaticProductQuantity(p);
+      const validation = validateInventoryQuantity(p, cart, amount);
+      if (!validation.ok) {
+        rejectInventory(p, validation);
+        after?.();
+        return;
+      }
       setCart((current) => {
         const next = current.map((x) => ({ ...x }));
         const line = next.find((x) => x.id === p.id);
@@ -360,7 +385,17 @@ export default function App() {
       requestId.current = uid();
       after?.();
       return;
-    }    form("quantity", id, {
+    }
+    if (index != null && !cart[index]) {
+      toast("El producto ya no está disponible en la venta. Vuelve a seleccionarlo.", "error", 4000);
+      return;
+    }
+    if (!p.dairy && Number(p.available ?? 0) <= 0) {
+      rejectInventory(p, { available: Number(p.available ?? 0) });
+      after?.();
+      return;
+    }
+    form("quantity", id, {
       product: p,
       index,
       after,
@@ -369,7 +404,7 @@ export default function App() {
           ? p.unit === "g"
             ? ""
             : 1
-          : qty(cart[index].qty, p.unit),
+          : qty(cart[index]?.qty || 0, p.unit),
     });
   }
   async function saveForm(d) {
@@ -380,6 +415,8 @@ export default function App() {
         q = Math.round(raw);
       if (q <= 0 || Math.abs(raw - q) > 0.000001)
         throw Error("Cantidad inválida");
+      const validation = validateInventoryQuantity(p, cart, q, modal.index);
+      if (!validation.ok) throw Error(rejectInventory(p, validation));
       setCart((current) => {
         const next = current.map((x) => ({ ...x }));
         if (modal.index != null) next[modal.index].qty = q;
@@ -403,9 +440,10 @@ export default function App() {
       return;
     }
     if (type === "unregistered_product") {
-      const q=Number(d.qty), price=Math.round(Number(d.price)*100), total=q*price;
+      const q=Number(d.qty), price=Math.round(Number(d.price)*100), total=q*price, description=String(d.description||"OTROS").trim().toUpperCase();
       if(!Number.isInteger(q)||q<1||price<1) throw Error("Revise la cantidad y el precio");
-      setCart(c=>[...c,{id:`extra-${uid()}`,unregistered:true,name:"Producto no registrado",qty:q,unit:"und",price,originalPrice:price,discount:0,total,price_basis:1,description:"No afecta inventario"}]);
+      if(!unregisteredTypes.includes(description)) throw Error("Seleccione un tipo de producto válido");
+      setCart(c=>[...c,{id:`extra-${uid()}`,unregistered:true,name:description,qty:q,unit:"und",price,originalPrice:price,discount:0,total,price_basis:1,description:"Producto no registrado · no afecta inventario"}]);
       requestId.current=uid(); close(); return;
     }
     let payload = { ...d };
@@ -594,7 +632,7 @@ export default function App() {
           }
           const q = await api(business, "/api/quote?id=" + id);
           const lines = q.lines.map((l) => {
-            if(l.unregistered) return {id:`extra-${uid()}`,unregistered:true,name:"Producto no registrado",qty:l.qty,unit:"und",price:l.price,originalPrice:l.price,discount:0,total:l.total,price_basis:1,description:"No afecta inventario"};
+            if(l.unregistered) return {id:`extra-${uid()}`,unregistered:true,name:l.name||l.description||"OTROS",qty:l.qty,unit:"und",price:l.price,originalPrice:l.price,discount:0,total:l.total,price_basis:1,description:"Producto no registrado · no afecta inventario"};
             const p = state.products.find((p) => p.id === l.product_id);
             if (!p)
               throw Error("La cotización contiene un producto no disponible");
@@ -791,7 +829,7 @@ export default function App() {
               ))}
             </div>
             <button
-              className={`status sync-status ${!online || pending ? "local-mode" : ""}`}
+              className={`status sync-status ${!online || pending || state.degraded ? "local-mode" : ""}`}
               title="Sincronizar operaciones pendientes"
               onClick={async () => {
                 if (!navigator.onLine) return toast("Sin conexión. Las operaciones siguen guardadas en este equipo.");
@@ -801,7 +839,7 @@ export default function App() {
                 toast(result.pending ? `${result.pending} operación(es) aún pendientes` : "Sincronización al día");
               }}
             >
-              {online ? "En línea" : "Sin internet"}{pending ? ` · ${pending} pendiente(s)` : " · sincronizado"}
+              {state.degraded ? "Modo local · D1 en pausa" : online ? "En línea" : "Sin internet"}{pending ? ` · ${pending} pendiente(s)` : state.degraded ? "" : " · sincronizado"}
             </button>
             <Badge tone={state.cash?.offline || !state.cash ? "warn" : ""}>
               {state.cash ? (state.cash.offline ? "Caja local · pendiente" : "Caja abierta #" + state.cash.id) : "Caja cerrada"}
@@ -875,8 +913,8 @@ export default function App() {
         )
       )}
       {message && (
-        <div className="react-toast" role="status" aria-live="polite">
-          {message}
+        <div className={`react-toast ${message.tone === "error" ? "error" : ""}`} role={message.tone === "error" ? "alert" : "status"} aria-live={message.tone === "error" ? "assertive" : "polite"}>
+          {message.text}
         </div>
       )}
     </>

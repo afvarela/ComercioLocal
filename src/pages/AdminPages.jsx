@@ -10,6 +10,8 @@ import {
   DateRange,
   Field,
 } from "../components/UI.jsx";
+import { matchesProductSearch } from "../lib/productSearch.js";
+import { useProductSearch } from "../lib/useProductSearch.js";
 import {
   cop,
   dt,
@@ -139,14 +141,15 @@ export function Inventory({
 }) {
   const [tab, setTab] = useState("products"),
     [search, setSearch] = useState(""), [categoryFilter,setCategoryFilter]=useState("");
+  const productSearch = useProductSearch(business, state.products, search, 90);
   const near = state.lots.filter(
       (l) => l.expires && l.expires <= localDate(30),
     ),
     low = state.products.filter((p) => p.available <= p.min_stock);
-  const products = state.products.filter((p) =>
-    (!categoryFilter||p.category===categoryFilter) && normalize([p.name, p.sku, p.barcode, p.description].join(" ")).includes(
-      normalize(search),
-    ),
+  const products = (search.trim() ? productSearch.products : state.products).filter(
+    (p) =>
+      (!categoryFilter || p.category === categoryFilter) &&
+      matchesProductSearch(p, search),
   );
   return (
     <>
@@ -225,7 +228,10 @@ export function Inventory({
             aria-label="Buscar en inventario"
             placeholder="Buscar producto o referencia"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              if (e.target.value.trim()) setCategoryFilter("");
+            }}
           /></div>
         )}
       </div>

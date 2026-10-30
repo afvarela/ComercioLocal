@@ -156,12 +156,13 @@ def statements(sql: str):
         yield current.strip()
 
 
-def apply_logistics_migration(token: str, account: str, database: str):
+def apply_required_migrations(token: str, account: str, database: str):
     url = f"{API}/accounts/{account}/d1/database/{database}/query"
-    sql = (ROOT / "cloudflare" / "migrations" / "0010_logistics.sql").read_text(encoding="utf-8")
-    for statement in statements(sql):
-        api_request(url, token, "POST", json.dumps({"sql": statement}).encode())
-
+    migration_dir = ROOT / "cloudflare" / "migrations"
+    for name in ("0010_logistics.sql", "0011_d1_read_optimization.sql", "0012_product_search_fts.sql", "0013_clean_product_search.sql"):
+        sql = (migration_dir / name).read_text(encoding="utf-8")
+        for statement in statements(sql):
+            api_request(url, token, "POST", json.dumps({"sql": statement}).encode())
 
 def multipart(metadata: dict, modules: list[pathlib.Path]):
     boundary = "----ComercioLocal" + secrets.token_hex(16)
@@ -283,10 +284,11 @@ def verify_worker(token: str, config: dict):
     with urllib.request.urlopen(request, timeout=60) as response:
         content = response.read()
     for required in (
-        b"version:'3.3.2'",
+        b"version:'3.3.4'",
         b"typeof db.one==='function'",
         b"width=/width:72mm/.test(source)?38:28",
-        b"date(s.created,'-5 hours')",
+        b"s.created>=? AND s.created<?",
+        b"product_search MATCH ?",
     ):
         if required not in content:
             raise RuntimeError(f"El Worker publicado no contiene la corrección esperada: {required.decode()}")
@@ -296,8 +298,8 @@ def main():
     config = json.loads(CONFIG.read_text(encoding="utf-8"))
     token = refresh_oauth()
     print("Sesión de Cloudflare renovada.")
-    apply_logistics_migration(token, config["account_id"], config["d1_databases"][0]["database_id"])
-    print("Tablas de despachos verificadas en D1.")
+    apply_required_migrations(token, config["account_id"], config["d1_databases"][0]["database_id"])
+    print("Migraciones de despachos, optimización D1 y búsqueda FTS verificadas.")
     assets_jwt = sync_assets(token, config)
     print("Archivos web sincronizados.")
     deploy_worker(token, config, assets_jwt)

@@ -17,6 +17,30 @@ Object.defineProperty(globalThis, "fetch", { value: async () => { throw new Type
 
 const { api, pendingSales, syncPendingSales } = await import(`../src/lib/api.js?offline-test=${Date.now()}`);
 
+test("usa el estado local si Cloudflare D1 alcanza su limite diario", async () => {
+  storage.clear();
+  navigator.onLine = true;
+  localStorage.setItem("pos-offline-session-v1", "1");
+  localStorage.setItem("pos-api-cache-v2", JSON.stringify({
+    "1:/api/state": { products: [{ id: 7, name: "Producto guardado", available: 2, stock: 2 }] },
+  }));
+  Object.defineProperty(globalThis, "fetch", {
+    value: async () => new Response(
+      JSON.stringify({ error: "Cloudflare D1 alcanzó el límite diario de lecturas." }),
+      { status: 503, headers: { "Content-Type": "application/json" } },
+    ),
+    configurable: true,
+  });
+  const result = await api(1, "/api/state");
+  assert.equal(result.degraded, true);
+  assert.equal(result.products[0].name, "Producto guardado");
+  navigator.onLine = false;
+  Object.defineProperty(globalThis, "fetch", {
+    value: async () => { throw new TypeError("offline"); },
+    configurable: true,
+  });
+});
+
 test("una recarga offline usa el ultimo historial aunque cambie la fecha", async () => {
   storage.clear();
   const previous = { sales: [{ id: 9 }], stock_moves: [] };

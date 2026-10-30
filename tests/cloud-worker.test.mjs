@@ -7,6 +7,20 @@ import { receiptPlainText } from "../cloudflare/read.mjs";
 import { statusPlan } from "../cloudflare/logistics.mjs";
 import { buildInvoicePdfDocument } from "../cloudflare/invoice.mjs";
 
+test("el catálogo pagina productos y agrega lotes solo para la página solicitada", () => {
+  const source = fs.readFileSync(new URL("../cloudflare/read.mjs", import.meta.url), "utf8");
+  assert.match(source, /WITH page AS \(SELECT id,business_id,sku,barcode,name/);
+  assert.match(source, /LIMIT \?\) SELECT \$\{productFields\}/);
+  assert.match(source, /LEFT JOIN lots l ON l\.product_id=p\.id/);
+  assert.doesNotMatch(source, /SELECT SUM\(qty\) FROM lots WHERE product_id=p\.id/);
+});
+
+test("el Worker identifica claramente el limite diario de D1", () => {
+  const source = fs.readFileSync(new URL("../cloudflare/worker.mjs", import.meta.url), "utf8");
+  assert.match(source, /free tier daily row read limit/);
+  assert.match(source, /503/);
+});
+
 class SetupDatabase {
   constructor() {
     this.user = null;
@@ -83,7 +97,7 @@ test("status solicita configuracion cuando D1 no tiene usuarios", async () => {
   const { env } = environment();
   const response = await worker.fetch(new Request("https://comercio.example/api/status"), env);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { setup: true, cloud: true, version: "3.3.2" });
+  assert.deepEqual(await response.json(), { setup: true, cloud: true, version: "3.3.4" });
 });
 
 test("el primer administrador se crea solamente con un PIN de cuatro numeros", async () => {
@@ -132,10 +146,11 @@ test("Cloudflare filtra ventas y movimientos con la fecha de Colombia", () => {
   const read = fs.readFileSync(new URL("../cloudflare/read.mjs", import.meta.url), "utf8");
   const dairy = fs.readFileSync(new URL("../cloudflare/dairy.mjs", import.meta.url), "utf8");
 
-  assert.match(read, /date\(s\.created,'-5 hours'\) BETWEEN \? AND \?/);
+  assert.match(read, /s\.created>=\? AND s\.created<\?/);
   assert.match(read, /SELECT date\(created,'-5 hours'\) day/);
-  assert.match(read, /date\(c\.opened,'-5 hours'\) BETWEEN \? AND \?/);
+  assert.match(read, /c\.opened>=\? AND c\.opened<\?/);
   assert.doesNotMatch(read, /substr\([^)]*(?:created|opened),1,10\)/);
+  assert.match(read, /colombiaRange\(start,end\)/);
   assert.match(dairy, /date\(l\.created,'-5 hours'\) BETWEEN \? AND \?/);
 });
 
@@ -176,14 +191,13 @@ test("la aplicacion incluye manifiesto PWA y arranque offline", () => {
   assert.match(serviceWorker, /request\.mode === "navigate"/);
 });
 
-test("el cobro del minimarket incluye teclado y F5 abre fiadores", () => {
+test("el cobro usa teclado físico y F5 abre fiadores", () => {
   const checkout = fs.readFileSync(new URL("../src/components/Checkout.jsx", import.meta.url), "utf8");
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   const pages = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
-  assert.match(checkout, /business === 1/);
-  assert.match(checkout, /keypadOpen &&/);
-  assert.match(checkout, /setKeypadOpen\(true\)/);
-  assert.match(checkout, /role="dialog"/);
+  assert.doesNotMatch(checkout, /keypadOpen|numeric-pad|keypadValue/);
+  assert.match(checkout, /autoFocus=\{index === 0\}/);
+  assert.match(checkout, /requestSubmit\(printButton\.current\)/);
   assert.match(checkout, /nombre o c.dula/);
   assert.match(app, /e\.key==="F5"/);
   assert.match(pages, /Clientes fiadores/);
@@ -301,7 +315,7 @@ test("el POS soporta lectura rápida, F8, cobro compacto y libera la venta antes
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   const pos = fs.readFileSync(new URL("../src/pages/PointOfSale.jsx", import.meta.url), "utf8");
   const css = fs.readFileSync(new URL("../public/style.css", import.meta.url), "utf8");
-  assert.match(pos, /options\.scanned|\{ scanned \}/);
+  assert.match(pos, /\{ scanned, product \}/);
   assert.match(pos, /event\.key === "F8"/);
   assert.match(pos, /scrollIntoView/);
   assert.match(app, /if \(index == null && !productNeedsWeight\(p\)\)/);
@@ -310,14 +324,15 @@ test("el POS soporta lectura rápida, F8, cobro compacto y libera la venta antes
   assert.match(app, /printing\.then/);
   assert.match(checkout, /cash_received: payment\.cash/);
   assert.match(checkout, /change_given: payment\.change/);
-  assert.match(css, /\.checkout-dialog \.payment-list\{grid-template-columns:repeat\(5/);
+  assert.match(css, /\.checkout-dialog \.payment-list\{grid-template-columns:repeat\(2/);
 });
 
-test("al pulsar Punto de venta se actualizan existencias y cantidades", () => {
+test("al pulsar Punto de venta sincroniza solo estado y catálogo incremental", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   assert.match(app, /async function navigate\(id\)/);
-  assert.match(app, /if \(id !== "pos"\) return/);
-  assert.match(app, /await refresh\(\)/);
+  assert.match(app, /syncProductCatalog\(b, \{ full: details \}\)/);
+  assert.match(app, /catalog=0&details=/);
+  assert.match(app, /history: !\["pos", "vegetables"\]\.includes\(id\)/);
   assert.match(app, /onClick=\{\(\) => navigate\(id\)\}/);
 });
 

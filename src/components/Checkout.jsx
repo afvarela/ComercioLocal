@@ -1,19 +1,18 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { Modal, Field, Notice, Button } from "./UI.jsx";
 import { cop, methods, localDate, qty, unregisteredLinePayload } from "../lib/format.js";
 import { filterCustomers } from "../lib/customers.js";
-import { initialPayments, updatePayment, paymentState, keypadValue } from "../lib/payments.js";
+import { initialPayments, updatePayment, paymentState } from "../lib/payments.js";
 
 const icons = ["$", "N", "D", "B", "▣"];
 
-export default function Checkout({ total, business, cart, customers, customerId, requestId, quoteId, onClose, onSave }) {
+export default function Checkout({ total, cart, customers, customerId, requestId, quoteId, onClose, onSave }) {
   const [values, setValues] = useState(() => initialPayments(total));
   const [credit, setCredit] = useState(false);
   const [client, setClient] = useState(customerId || "");
   const [customerSearch, setCustomerSearch] = useState("");
   const [activeMethod, setActiveMethod] = useState("Efectivo");
-  const [replaceValue, setReplaceValue] = useState(true);
-  const [keypadOpen, setKeypadOpen] = useState(false);
+  const printButton = useRef(null);
   const payment = paymentState(total, values);
   const matchingCustomers = useMemo(() => {
     return filterCustomers(customers, customerSearch, 8);
@@ -24,12 +23,7 @@ export default function Checkout({ total, business, cart, customers, customerId,
   }
   function activate(method) {
     setActiveMethod(method);
-    setReplaceValue(true);
     if (method !== "Efectivo" && !values[method]) setPayment(method, String(total / 100));
-  }
-  function pressKey(key) {
-    setPayment(activeMethod, keypadValue(values[activeMethod], key, replaceValue));
-    setReplaceValue(false);
   }
   async function submit(data) {
     if (payment.excessElectronic) throw Error("Los medios electrónicos superan el total. Corrige sus valores antes de cobrar.");
@@ -52,7 +46,7 @@ export default function Checkout({ total, business, cart, customers, customerId,
   }
 
   return (
-    <Modal title="Cobrar venta" className="checkout-dialog" onClose={onClose} onSubmit={submit} wide actions={<div className="dialog-actions"><Button type="button" onClick={onClose}>Cancelar</Button><Button type="submit" name="print_receipt" value="0">Confirmar sin imprimir</Button><Button primary type="submit" name="print_receipt" value="1">Confirmar e imprimir</Button></div>}>
+    <Modal title="Cobrar venta" className="checkout-dialog" onClose={onClose} onSubmit={submit} wide actions={<div className="dialog-actions"><Button type="button" onClick={onClose}>Cancelar</Button><Button type="submit" name="print_receipt" value="0">Confirmar sin imprimir</Button><Button ref={printButton} primary type="submit" name="print_receipt" value="1">Confirmar e imprimir</Button></div>}>
       <div className="checkout-total"><span>Total de la venta</span><strong>{cop(total)}</strong></div>
       <p className="payment-help">Todo inicia en efectivo. Al escribir en otro medio, el efectivo se ajusta solo.</p>
       <div className="payment-list">
@@ -60,23 +54,10 @@ export default function Checkout({ total, business, cart, customers, customerId,
           <div className={`payment-method method-${index} ${activeMethod === method ? "active" : ""}`} key={method} onClick={() => activate(method)}>
             <span className="payment-icon" aria-hidden="true">{icons[index]}</span>
             <label htmlFor={`payment-${index}`}>{index === 0 ? "Efectivo recibido" : method}{index === 0 && <small>Saldo automático</small>}</label>
-            <div className="payment-value"><span>$</span><input id={`payment-${index}`} aria-label={`Valor en ${method}`} inputMode="decimal" type="number" min="0" step="0.01" placeholder="0" value={values[method]} onFocus={(event) => { activate(method); event.target.select(); }} onClick={(event) => { event.stopPropagation(); activate(method); if (business === 1) setKeypadOpen(true); }} onChange={(event) => setPayment(method, event.target.value)} /></div>
+            <div className="payment-value"><span>$</span><input id={`payment-${index}`} aria-label={`Valor en ${method}`} inputMode="decimal" enterKeyHint="done" autoFocus={index === 0} type="number" min="0" step="0.01" placeholder="0" value={values[method]} onFocus={(event) => { activate(method); event.target.select(); }} onClick={(event) => { event.stopPropagation(); activate(method); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.currentTarget.form?.requestSubmit(printButton.current); } }} onChange={(event) => setPayment(method, event.target.value)} /></div>
           </div>
         ))}
       </div>
-      {business === 1 && keypadOpen && (
-        <div className="keypad-backdrop" role="dialog" aria-modal="true" aria-label={`Teclado numérico para ${activeMethod}`}>
-        <div className="numeric-pad">
-          <div className="numeric-pad-head"><span>Valor recibido en <b>{activeMethod}</b></span><button type="button" className="close" onClick={() => setKeypadOpen(false)}>×</button></div>
-          <div className="numeric-pad-value">{cop(Math.round(Number(values[activeMethod] || 0) * 100))}</div>
-          <div className="numeric-pad-grid">
-            {["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0", "⌫"].map((key) => <button type="button" key={key} onClick={() => pressKey(key)}>{key}</button>)}
-            <button type="button" className="numeric-clear" onClick={() => { setPayment(activeMethod, ""); setReplaceValue(true); }}>Borrar valor</button>
-            <button type="button" className="numeric-accept primary" onClick={() => setKeypadOpen(false)}>Aceptar valor</button>
-          </div>
-        </div>
-        </div>
-      )}
       {payment.excessElectronic && <Notice>El pago electrónico supera la venta en {cop(payment.electronic - total)}. Corrige el valor.</Notice>}
       <div className={`pay-balance ${payment.remaining ? "pending" : ""}`}><span>{payment.change ? "Cambio a entregar" : payment.remaining ? "Saldo pendiente" : "Pago completo"}</span><b>{cop(payment.change || payment.remaining || payment.paid)}</b></div>
       {!!payment.cash && <div className="cash-summary"><span>Recibido en efectivo <b>{cop(payment.cash)}</b></span><span>Cambio <b>{cop(payment.change)}</b></span></div>}

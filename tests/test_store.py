@@ -39,6 +39,25 @@ class CommerceTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.sale(p,2,10000)
         self.assertEqual(self.store.state(self.u,1)['products'][0]['available'],1)
         self.assertEqual(self.store.history(self.u,1,today(),today())['sales'],[])
+    def test_product_search_finds_partial_words_with_accents_and_stock(self):
+        product=self.run_cmd('product',{'sku':'TDESC-00737','barcode':'7701234567890','name':'SHAMPOO JÓHNSONS ORIGINAL 25ML','description':'Línea para niños','category':'Aseo','unit':'und','price':1800})['id']
+        self.run_cmd('product',{'sku':'TDESC-00782','name':'JABON DOVE 75 G ORIGINAL','description':'Importado desde Excel, fila 782. UM original: un','category':'Aseo','unit':'und','price':2500})
+        self.run_cmd('product',{'sku':'TDESC-01071','name':'AGUILA ORIGINAL LATA 330ML','description':'Importado desde Excel, fila 1071. UM original: un','category':'Bebidas','unit':'und','price':4000})
+        decoy=self.run_cmd('product',{'sku':'TDESC-01099','name':'ACEITE BEBE JUNIORS 50ml','description':'Importado desde Excel, fila 1099. UM original: un','category':'Aseo','unit':'und','price':2500})['id']
+        self.lot(product,5)
+        for query in ('ORIGINAL','ORIG'):
+            found=self.store.product_search(1,query)['products']
+            self.assertEqual({x['name'] for x in found},{'SHAMPOO JÓHNSONS ORIGINAL 25ML','JABON DOVE 75 G ORIGINAL','AGUILA ORIGINAL LATA 330ML'},query)
+            self.assertNotIn(decoy,{x['id'] for x in found})
+        for query in ('johnsons','linea ninos','SHA* ORI*'):
+            found=self.store.product_search(1,query)['products']
+            self.assertEqual(found[0]['id'],product,query)
+            self.assertEqual(found[0]['available'],5)
+        exact=self.store.product_search(1,'7701234567890',exact=True)['products']
+        self.assertEqual(exact[0]['id'],product)
+        with self.store.connect() as db:
+            plan=' '.join(row['detail'] for row in db.execute("EXPLAIN QUERY PLAN SELECT product_id FROM product_search WHERE product_search MATCH ? AND business_id=?",('orig',1)))
+            self.assertIn('VIRTUAL TABLE INDEX',plan)
     def test_vegetable_receipt_does_not_require_lot_supplier_or_expiry(self):
         p=self.run_cmd('product',{'sku':'VER-TEST','name':'Verdura prueba','category':'Verduras','unit':'g','price':4000,'price_basis':500,'perishable':True})['id']
         result=self.run_cmd('receive',{'product_id':p,'qty':1000,'cost':2000,'sale_price':5500})
@@ -225,11 +244,11 @@ class CommerceTests(unittest.TestCase):
             self.assertEqual(tuple(row),(-100,'Faltante','Error de conteo'))
 
     def test_unregistered_line_is_sold_without_stock(self):
-        result=self.run_cmd('sale',{'request_id':uuid.uuid4().hex,'lines':[],'unregistered_lines':[{'description':'Servicio de corte','qty':2,'price':3000,'discount':500}],'payments':[{'method':'Efectivo','amount':5500}]})
+        result=self.run_cmd('sale',{'request_id':uuid.uuid4().hex,'lines':[],'unregistered_lines':[{'description':'DULCES DETAL','qty':2,'price':3000,'discount':500}],'payments':[{'method':'Efectivo','amount':5500}]})
         with self.store.connect() as db:
             self.assertEqual(db.execute('SELECT total FROM sales WHERE id=?',(result['id'],)).fetchone()[0],550000)
             self.assertEqual(db.execute('SELECT total FROM unregistered_sale_lines WHERE sale_id=?',(result['id'],)).fetchone()[0],550000)
-        self.assertIn('Servicio de corte',self.store.receipt(1,'sale',result['id']))
+        self.assertIn('DULCES DETAL',self.store.receipt(1,'sale',result['id']))
 
     def test_analytics_returns_business_indicators(self):
         p=self.product();self.lot(p);self.sale(p)
@@ -263,6 +282,6 @@ class CommerceTests(unittest.TestCase):
         q=self.run_cmd('quote',{'lines':[],'unregistered_lines':[{'qty':2,'price':1250}],'valid_until':today()},2)
         with self.store.connect() as db:
             saved=db.execute('SELECT lines,total FROM quotes WHERE id=?',(q['id'],)).fetchone()
-            self.assertIn('Producto no registrado',saved['lines']);self.assertEqual(saved['total'],250000)
+            self.assertIn('OTROS',saved['lines']);self.assertEqual(saved['total'],250000)
 
 if __name__=='__main__': unittest.main(verbosity=2)

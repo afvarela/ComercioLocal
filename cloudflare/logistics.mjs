@@ -19,15 +19,15 @@ export function statusPlan(current,target){
   return {reset,complete:target==='Entregado',delivered:target==='Entregado'||target==='Entrega parcial'};
 }
 
-export async function logisticsState(db,u,b,search=''){
+export async function logisticsState(db,u,b,search='',includeProducts=true){
   const term=`%${clean(search).toLowerCase()}%`;
   const sales=await rows(db,`SELECT s.id,s.number,s.created,s.status,s.customer_id,COALESCE(c.name,'Consumidor final') customer,COALESCE(c.phone,'') phone,
     COALESCE((SELECT SUM(sl.qty-COALESCE((SELECT SUM(sr.qty) FROM sales_return_lines sr JOIN sales_returns r ON r.id=sr.return_id WHERE sr.sale_line_id=sl.id),0)-COALESCE((SELECT SUM(CASE WHEN d.status='Entrega parcial' THEN dl.delivered_qty ELSE dl.qty END) FROM dispatch_lines dl JOIN dispatches d ON d.id=dl.dispatch_id WHERE dl.sale_line_id=sl.id AND d.status!='Cancelado'),0)) FROM sale_lines sl WHERE sl.sale_id=s.id),0) pending_qty
     FROM sales s LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.status='active' AND (CAST(s.number AS TEXT) LIKE ? OR lower(COALESCE(c.name,'')) LIKE ? OR COALESCE(c.phone,'') LIKE ?) ORDER BY s.id DESC LIMIT 60`,[b,term,term,term]);
   const dispatches=await rows(db,`SELECT d.*,s.number sale_number,COALESCE(c.name,'Consumidor final') customer,u.name creator,
-    (SELECT COUNT(*) FROM dispatch_lines WHERE dispatch_id=d.id) line_count FROM dispatches d JOIN sales s ON s.id=d.sale_id LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=d.created_by WHERE d.business_id=? ORDER BY d.id DESC`,[b]);
-  for(const item of dispatches)item.lines=await rows(db,'SELECT * FROM dispatch_lines WHERE dispatch_id=? ORDER BY id',[item.id]);
-  const products=await rows(db,'SELECT id,sku,barcode,name,category,price FROM products WHERE business_id=? AND active=1 ORDER BY name',[b]);
+    (SELECT COUNT(*) FROM dispatch_lines WHERE dispatch_id=d.id) line_count FROM dispatches d JOIN sales s ON s.id=d.sale_id LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=d.created_by WHERE d.business_id=? ORDER BY d.id DESC LIMIT 200`,[b]);
+  const dispatchIds=dispatches.map(item=>item.id),dispatchLines=dispatchIds.length?await rows(db,`SELECT * FROM dispatch_lines WHERE dispatch_id IN (${dispatchIds.map(()=>'?').join(',')}) ORDER BY dispatch_id,id`,dispatchIds):[],linesByDispatch=new Map();for(const line of dispatchLines){if(!linesByDispatch.has(line.dispatch_id))linesByDispatch.set(line.dispatch_id,[]);linesByDispatch.get(line.dispatch_id).push(line);}for(const item of dispatches)item.lines=linesByDispatch.get(item.id)||[];
+  const products=includeProducts?await rows(db,'SELECT id,sku,barcode,name,category,price FROM products WHERE business_id=? AND active=1 ORDER BY name',[b]):[];
   const label_settings=await one(db,'SELECT * FROM label_settings WHERE business_id=?',[b]);
   return {sales,dispatches,products,label_settings,permissions:{view:true,create:true,update:true,confirm:true,cancel:u.role==='admin',print:true,labels:true,configure:u.role==='admin'}};
 }
