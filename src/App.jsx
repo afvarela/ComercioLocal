@@ -479,6 +479,16 @@ export default function App() {
       payload.active = id ? Boolean(d.active) : true;
     }
     const result = await command(type, payload);
+    if (type === "waste" || type === "product") {
+      close();
+      try {
+        await refresh(business, start, end, { details: true, history: type === "waste" });
+        toast(type === "waste" ? "Merma registrada e inventario actualizado" : "Producto actualizado correctamente");
+      } catch {
+        toast("Los datos se guardaron. Recarga la pantalla para actualizar el inventario.");
+      }
+      return;
+    }
     if (type === "change_password") {
       setState(null);
       setSetup(false);

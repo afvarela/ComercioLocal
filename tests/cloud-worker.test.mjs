@@ -374,14 +374,14 @@ test("despachos permiten seleccionar una impresora predeterminada", () => {
 
 test("crear un despacho imprime directamente sin abrir otra ventana", () => {
   const logistics = fs.readFileSync(new URL("../src/pages/Logistics.jsx", import.meta.url), "utf8");
-  assert.match(logistics, /await printDispatch\(business,result\.id\)/);
+  assert.match(logistics, /await\s+printDispatch\(business,\s*result\.id\)/);
   assert.doesNotMatch(logistics, /window\.open\(`\/dispatch\?business=\$\{business\}&id=\$\{result\.id\}/);
 });
 
 test("crear despacho usa la fecha de Colombia y muestra los errores de la API", () => {
   const logistics = fs.readFileSync(new URL("../src/pages/Logistics.jsx", import.meta.url), "utf8");
   const format = fs.readFileSync(new URL("../src/lib/format.js", import.meta.url), "utf8");
-  assert.match(logistics, /colombiaDate\(x\.created\)===saleDate/);
+  assert.match(logistics, /colombiaDate\(x\.created\)\s*===\s*saleDate/);
   assert.match(logistics, /defaultValue=\{localDate\(\)\}/);
   assert.match(logistics, /No se pudo crear el despacho:/);
   assert.match(logistics, /No hay ventas con mercancía pendiente/);
@@ -391,15 +391,15 @@ test("crear despacho usa la fecha de Colombia y muestra los errores de la API", 
 test("los despachos activos se pueden marcar como entregados", () => {
   const logistics = fs.readFileSync(new URL("../src/pages/Logistics.jsx", import.meta.url), "utf8");
   const backend = fs.readFileSync(new URL("../logistics.py", import.meta.url), "utf8");
-  assert.match(logistics, /quickStatuses\.filter\(status=>status!==x\.status\)/);
-  assert.match(logistics, /onClick=\{\(\)=>changeStatus\(x,status\)\}/);
-  assert.match(logistics, /setData\(current=>/);
+  assert.match(logistics, /quickStatuses[\s\S]{0,80}\.filter\(\(status\)\s*=>\s*status\s*!==\s*x\.status\)/);
+  assert.match(logistics, /onClick=\{\(\)\s*=>\s*changeStatus\(x,\s*status\)\}/);
+  assert.match(logistics, /setData\(\(current\)\s*=>/);
   assert.match(logistics, /No se pudo actualizar el pedido/);
   assert.match(logistics, /type="button"/);
   assert.match(logistics, /Reabrir como pendiente/);
-  assert.match(logistics, /changeStatus\(x,"Pendiente"\)/);
-  assert.match(logistics, /const partial=status==="Entrega parcial"/);
-  assert.match(logistics, /quickStatuses=\["En reparto","Entregado","Cancelado"\]/);
+  assert.match(logistics, /changeStatus\(x,\s*"Pendiente"\)/);
+  assert.match(logistics, /const partial\s*=\s*status\s*===\s*"Entrega parcial"/);
+  assert.match(logistics, /quickStatuses\s*=\s*\["En reparto",\s*"Entregado",\s*"Cancelado"\]/);
   assert.doesNotMatch(logistics, /status==="Cancelado"&&!confirm/);
   assert.match(backend, /'Pendiente':\{'En preparacion','Entregado','Cancelado'\}/);
   assert.match(backend, /'Entregado':\{'Pendiente'\}/);
@@ -430,14 +430,51 @@ test("el diseñador de etiquetas previsualiza y envia sus medidas", () => {
   assert.match(logistics, /field="name_size"/);
   assert.match(logistics, /field="price_size"/);
   assert.match(logistics, /field="barcode_height"/);
-  assert.match(logistics, /const payload=\{\.\.\.design,items:/);
+  assert.match(logistics, /field="barcode_gap_mm"/);
+  assert.match(logistics, /field="gap_mm"/);
+  assert.match(logistics, /field="row_gap_mm"/);
+  assert.match(logistics, /field="page_margin_mm"/);
+  assert.match(logistics, /Dos por fila compactas/);
+  assert.match(logistics, /const payload\s*=\s*\{[\s\S]{0,80}\.\.\.design,[\s\S]{0,80}items:/);
   assert.match(logistics, /Vista previa exacta/);
-  assert.match(logistics, /await printLabels\(business,html\)/);
+  assert.match(logistics, /await\s+printLabels\(business,\s*html\)/);
   assert.doesNotMatch(logistics, /addEventListener\("load",\(\)=>w\.print\(\)/);
   assert.match(printer, /\/print-labels/);
   assert.doesNotMatch(printer, /foreignObject|drawImage\(/);
   assert.match(printer, /drawBarcode/);
+  assert.match(printer, /dataset\.columns/);
+  assert.match(printer, /index\+=columns/);
+  assert.match(agent, /y_offset\+=target_h/);
   assert.match(agent, /def print_label_bitmaps/);
+});
+
+test("Cloudflare genera codigos de barras SVG reales para las etiquetas", () => {
+  const cloud = fs.readFileSync(new URL("../cloudflare/logistics.mjs", import.meta.url), "utf8");
+  const designer = fs.readFileSync(new URL("../src/pages/Logistics.jsx", import.meta.url), "utf8");
+  const printer = fs.readFileSync(new URL("../src/lib/printer.js", import.meta.url), "utf8");
+  assert.match(cloud, /CODE128_PATTERNS/);
+  assert.match(cloud, /function barcodeSvg/);
+  assert.match(cloud, /barcodeSvg\(product\.barcode\|\|product\.sku/);
+  assert.match(cloud, /row_gap_mm/);
+  assert.match(cloud, /page_margin_mm/);
+  assert.match(cloud, /barcode_gap_mm/);
+  assert.match(cloud, /maximumFractionDigits:0/);
+  assert.match(cloud, /labelMoney\(product\.price\)/);
+  assert.doesNotMatch(cloud, /<div class="sku">/);
+  assert.doesNotMatch(cloud, /<div class="barcode-value">Código:/);
+  assert.doesNotMatch(designer, /className="designer-sku"/);
+  assert.match(designer, /labelPrice\(sample\.price\)/);
+  assert.match(designer, /Papel 58 mm/);
+  assert.match(printer, /classList\.contains\("price"\)/);
+});
+
+test("inventario cierra la merma antes de refrescar y permite editar el costo", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
+  assert.match(app, /type === "waste" \|\| type === "product"/);
+  assert.match(app, /close\(\);[\s\S]{0,100}await refresh/);
+  assert.match(form, /name="current_cost"/);
+  assert.match(form, /Las compras y ventas anteriores conservarán su costo histórico/);
 });
 
 test("logistica conserva tildes y eñes sin mojibake", () => {

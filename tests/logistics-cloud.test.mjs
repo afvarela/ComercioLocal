@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {logisticsCommand} from '../cloudflare/logistics.mjs';
+import {command as storeCommand} from '../cloudflare/store.mjs';
 
 class SQLiteD1 {
   constructor(){this.db=new DatabaseSync(':memory:')}
@@ -44,6 +45,35 @@ class LogisticsD1 {
     throw Error('SQL run no simulado: '+sql);
   }
 }
+
+test('D1 conserva el estado activo al editar un producto y solo lo cambia de forma explicita',async()=>{
+  const db=new SQLiteD1();
+  db.db.exec(`
+    CREATE TABLE cloud_revision(id INTEGER PRIMARY KEY,version INTEGER NOT NULL);
+    INSERT INTO cloud_revision VALUES(1,0);
+    CREATE TABLE products(id INTEGER PRIMARY KEY,business_id INTEGER,sku TEXT,barcode TEXT,name TEXT,description TEXT,category TEXT,unit TEXT,price INTEGER,min_stock INTEGER,max_stock INTEGER,reorder_point INTEGER,lead_time_days INTEGER,perishable INTEGER,active INTEGER,price_basis INTEGER,current_cost INTEGER);
+    INSERT INTO products VALUES(1,1,'SKU-1',NULL,'Producto','', '', 'und',500000,0,0,0,3,0,1,1000,300000);
+    CREATE TABLE lots(id INTEGER PRIMARY KEY,business_id INTEGER,product_id INTEGER,qty INTEGER,cost INTEGER,cost_basis INTEGER);
+    INSERT INTO lots VALUES(1,1,1,10,300000,1000);
+    CREATE TABLE stock_moves(id INTEGER PRIMARY KEY,business_id INTEGER,product_id INTEGER,lot_id INTEGER,user_id INTEGER,created TEXT,qty INTEGER,kind TEXT,reference TEXT,cost INTEGER,cost_basis INTEGER,balance_after INTEGER,note TEXT);
+    CREATE TABLE audit(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,created TEXT,action TEXT,detail TEXT);
+  `);
+  const user={id:3,role:'admin'},base={id:1,name:'Producto editado',unit:'und',price:6000};
+  await storeCommand(db,user,1,'product',base);
+  assert.equal(db.db.prepare('SELECT active FROM products WHERE id=1').get().active,1);
+  await storeCommand(db,user,1,'product',{...base,active:''});
+  assert.equal(db.db.prepare('SELECT active FROM products WHERE id=1').get().active,0);
+  await storeCommand(db,user,1,'product',{...base,active:'1'});
+  assert.equal(db.db.prepare('SELECT active FROM products WHERE id=1').get().active,1);
+  await storeCommand(db,user,1,'product',{...base,current_cost:4500});
+  assert.equal(db.db.prepare('SELECT current_cost FROM products WHERE id=1').get().current_cost,450000);
+  assert.equal(db.db.prepare('SELECT cost FROM lots WHERE id=1').get().cost,450000);
+  assert.equal(db.db.prepare("SELECT COUNT(*) count FROM stock_moves WHERE kind='Ajuste de costo'").get().count,1);
+  await storeCommand(db,user,1,'waste',{lot_id:1,qty:2,reason:'Avería'});
+  assert.equal(db.db.prepare('SELECT qty FROM lots WHERE id=1').get().qty,8);
+  const waste=db.db.prepare("SELECT * FROM stock_moves WHERE kind='Merma / ajuste'").get();
+  assert.equal(waste.cost,450000);assert.equal(waste.balance_after,8);
+});
 
 test('D1 guarda En reparto, Entregado y la reapertura del despacho',async()=>{
   const db=new LogisticsD1(),user={id:3,role:'admin'};

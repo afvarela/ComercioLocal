@@ -203,6 +203,15 @@ class CommerceTests(unittest.TestCase):
         sale=self.sale(p,250,1000)
         with self.store.connect() as db: self.assertEqual(db.execute('SELECT cost FROM sales WHERE id=?',(sale['id'],)).fetchone()[0],50000)
 
+    def test_product_edit_preserves_active_state_unless_explicitly_changed(self):
+        p=self.product('Producto activo')
+        self.run_cmd('product',{'id':p,'name':'Producto editado','unit':'und','price':6000})
+        with self.store.connect() as db: self.assertEqual(db.execute('SELECT active FROM products WHERE id=?',(p,)).fetchone()[0],1)
+        self.run_cmd('product',{'id':p,'name':'Producto editado','unit':'und','price':6000,'active':''})
+        with self.store.connect() as db: self.assertEqual(db.execute('SELECT active FROM products WHERE id=?',(p,)).fetchone()[0],0)
+        self.run_cmd('product',{'id':p,'name':'Producto editado','unit':'und','price':6000,'active':'1'})
+        with self.store.connect() as db: self.assertEqual(db.execute('SELECT active FROM products WHERE id=?',(p,)).fetchone()[0],1)
+
     def test_moving_average_cost_keeps_purchase_history(self):
         p=self.product(price=20000)
         self.lot(p,10,10000)
@@ -212,6 +221,29 @@ class CommerceTests(unittest.TestCase):
             self.assertEqual(product['current_cost'],1133333)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM purchases WHERE business_id=1').fetchone()[0],2)
             self.assertEqual([r[0] for r in db.execute('SELECT cost FROM purchase_lines ORDER BY id')],[1000000,1400000])
+
+    def test_editing_product_cost_revalues_only_current_stock(self):
+        p=self.product(price=9000);self.lot(p,10,3000)
+        first=self.sale(p,1,9000)
+        with self.store.connect() as db: product=dict(db.execute('SELECT * FROM products WHERE id=?',(p,)).fetchone())
+        self.run_cmd('product',{'id':p,'sku':product['sku'],'name':product['name'],'unit':'und','price':9000,'current_cost':4500})
+        second=self.sale(p,1,9000)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT current_cost FROM products WHERE id=?',(p,)).fetchone()[0],450000)
+            self.assertEqual(db.execute('SELECT cost FROM lots WHERE product_id=? AND qty>0',(p,)).fetchone()[0],450000)
+            self.assertEqual(db.execute('SELECT cost FROM sales WHERE id=?',(first['id'],)).fetchone()[0],300000)
+            self.assertEqual(db.execute('SELECT cost FROM sales WHERE id=?',(second['id'],)).fetchone()[0],450000)
+            self.assertEqual(db.execute('SELECT cost FROM purchase_lines WHERE product_id=?',(p,)).fetchone()[0],300000)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stock_moves WHERE product_id=? AND kind='Ajuste de costo'",(p,)).fetchone()[0],1)
+
+    def test_waste_updates_lot_kardex_and_remaining_average_cost(self):
+        p=self.product(price=10000);first=self.lot(p,2,2000);self.lot(p,3,4000)
+        self.run_cmd('waste',{'lot_id':first,'qty':2,'reason':'Producto vencido'})
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT qty FROM lots WHERE id=?',(first,)).fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT current_cost FROM products WHERE id=?',(p,)).fetchone()[0],400000)
+            move=db.execute("SELECT * FROM stock_moves WHERE lot_id=? AND kind='Ajuste negativo' ORDER BY id DESC",(first,)).fetchone()
+            self.assertEqual(move['qty'],-2);self.assertEqual(move['cost'],200000);self.assertEqual(move['balance_after'],3)
 
     def test_cash_uses_exact_cents_with_credit_and_mixed_payments(self):
         p=self.product(price=10.50);self.lot(p,3,5.00)

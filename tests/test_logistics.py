@@ -26,7 +26,10 @@ class LogisticsTests(unittest.TestCase):
   logistics_command(self.store,self.u,1,'status',{'id':dispatch,'status':'Cancelado'});logistics_command(self.store,self.u,1,'status',{'id':dispatch,'status':'En reparto'});logistics_command(self.store,self.u,1,'status',{'id':dispatch,'status':'Entregado'})
   self.assertEqual(logistics_state(self.store,self.u,1)['dispatches'][0]['status'],'Entregado')
  def test_labels_multiple_copies_include_all_product_data(self):
-  page=labels_html(self.store,1,{'items':[{'product_id':self.p,'count':3}],'format':'large'});self.assertEqual(page.count('<article>'),3);self.assertIn('Arroz de prueba con nombre largo 500 gramos',page);self.assertIn('SKU: ARROZ-500',page);self.assertIn('$ 3,500',page);self.assertIn('<svg',page);self.assertIn('7701234567890',page)
+  page=labels_html(self.store,1,{'items':[{'product_id':self.p,'count':3}],'format':'large'});self.assertEqual(page.count('<article>'),3);self.assertIn('Arroz de prueba con nombre largo 500 gramos',page);self.assertNotIn('SKU:',page);self.assertNotIn("class='sku'",page);self.assertIn('$ 3.500',page);self.assertNotIn('$ 3.500,00',page);self.assertIn('<svg',page);self.assertIn('7701234567890',page);self.assertNotIn('C&oacute;digo:',page);self.assertIn('data-columns="1"',page)
+ def test_compact_labels_keep_barcode_and_configurable_cut_gaps(self):
+  page=labels_html(self.store,1,{'items':[{'product_id':self.p,'count':2}],'format':'small','width_mm':50,'height_mm':12,'margin_mm':0,'name_size':6,'price_size':8,'barcode_height':3,'gap_mm':2,'row_gap_mm':1,'page_margin_mm':0,'barcode_gap_mm':2})
+  self.assertIn('data-columns="2"',page);self.assertIn('column-gap:2mm',page);self.assertIn('row-gap:1mm',page);self.assertIn('height:12mm',page);self.assertIn('@page{size:50mm auto;margin:0mm',page);self.assertIn('margin-top:2mm',page);self.assertIn('white-space:nowrap',page);self.assertIn('max-height:3.3em',page);self.assertEqual(page.count('<svg'),2)
  def test_dispatch_html_uses_safe_entities_for_accents(self):
   receipt=dispatch_receipt(self.store,1,self.create(10)['id']);self.assertIn('Tel&#233;fono:',receipt);self.assertIn('Direcci&#243;n:',receipt);self.assertIn('SATISFACCI&#211;N',receipt);self.assertIn('C&#233;dula:',receipt);self.assertNotIn('Ã',receipt)
  def test_dispatch_receipt_uses_pos_width_and_complete_product_detail(self):

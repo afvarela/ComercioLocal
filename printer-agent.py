@@ -106,6 +106,7 @@ def print_label_bitmaps(name,pages):
     try:
         if gdi.StartDocW(hdc,ctypes.byref(doc))<=0: raise ctypes.WinError(ctypes.get_last_error())
         started=True;printable_w=gdi.GetDeviceCaps(hdc,8);printable_h=gdi.GetDeviceCaps(hdc,10)
+        page_started=False;y_offset=0
         for page in pages:
             width=int(page['width']);height=int(page['height']);gray=base64.b64decode(page['pixels'],validate=True)
             if width<1 or height<1 or width*height!=len(gray) or width*height>4000000: raise ValueError('Imagen de etiqueta inválida')
@@ -115,10 +116,15 @@ def print_label_bitmaps(name,pages):
                 for x in range(width):
                     value=gray[source+x];offset=target+x*3;dib[offset:offset+3]=bytes((value,value,value))
             header=struct.pack('<IiiHHIIiiII',40,width,height,1,24,0,len(dib),0,0,0,0);info=ctypes.create_string_buffer(header);bits=(ctypes.c_ubyte*len(dib)).from_buffer(dib)
-            if gdi.StartPage(hdc)<=0: raise ctypes.WinError(ctypes.get_last_error())
-            target_w=printable_w;target_h=min(printable_h,round(height*target_w/width));result=gdi.StretchDIBits(hdc,0,0,target_w,target_h,0,0,width,height,bits,info,0,0x00CC0020)
+            target_w=printable_w;target_h=min(printable_h,round(height*target_w/width))
+            if not page_started or (y_offset and y_offset+target_h>printable_h):
+                if page_started:gdi.EndPage(hdc)
+                if gdi.StartPage(hdc)<=0: raise ctypes.WinError(ctypes.get_last_error())
+                page_started=True;y_offset=0
+            result=gdi.StretchDIBits(hdc,0,y_offset,target_w,target_h,0,0,width,height,bits,info,0,0x00CC0020)
             if result in (0,-1): raise ctypes.WinError(ctypes.get_last_error())
-            gdi.EndPage(hdc)
+            y_offset+=target_h
+        if page_started:gdi.EndPage(hdc)
         if gdi.EndDoc(hdc)<=0: raise ctypes.WinError(ctypes.get_last_error())
         started=False
     except Exception:

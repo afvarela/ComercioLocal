@@ -151,6 +151,9 @@ class Store:
                 ('sales','dairy_total','INTEGER NOT NULL DEFAULT 0'),
                 ('sales','cash_received','INTEGER NOT NULL DEFAULT 0'),
                 ('sales','change_given','INTEGER NOT NULL DEFAULT 0'),
+                ('label_settings','row_gap_mm','INTEGER NOT NULL DEFAULT 0'),
+                ('label_settings','page_margin_mm','INTEGER NOT NULL DEFAULT 0'),
+                ('label_settings','barcode_gap_mm','INTEGER NOT NULL DEFAULT 2'),
             ]:
                 if column not in [r['name'] for r in db.execute(f'PRAGMA table_info({table})')]:
                     db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
@@ -296,18 +299,25 @@ class Store:
                 old=self.scoped(db,'products',d['id'],b) if d.get('id') else None
                 sku=clean(d.get('sku')) or (old['sku'] if old else f'AUTO-{b}-{secrets.token_hex(6).upper()}')
                 require(name and unit in ('und','g','m'),'Nombre y unidad son obligatorios')
-                active=int(bool(d.get('active'))) if d.get('id') else 1
-                vals=(sku,clean(d.get('barcode')) or None,name,clean(d.get('description'),1000),clean(d.get('category')),unit,money(d['price']),quantity(d.get('min_stock',0),unit),int(bool(d.get('perishable'))),active)
+                active=(int(str(d['active']).lower() not in ('','0','false','no')) if 'active' in d else int(old['active'])) if old else 1
+                current_cost=money(d['current_cost']) if old and 'current_cost' in d else int(old['current_cost']) if old else 0
+                cost_changed=bool(old and current_cost!=int(old['current_cost']))
+                vals=(sku,clean(d.get('barcode')) or None,name,clean(d.get('description'),1000),clean(d.get('category')),unit,money(d['price']),quantity(d.get('min_stock',0),unit),int(bool(d.get('perishable'))),active,current_cost)
                 basis=int(d.get('price_basis',1000)); require(basis in (500,1000),'Base de precio inválida')
                 if d.get('id'):
                     require(old['unit']==unit,'No se puede cambiar la unidad de un producto existente')
-                    db.execute('UPDATE products SET sku=?,barcode=?,name=?,description=?,category=?,unit=?,price=?,min_stock=?,perishable=?,active=? WHERE id=? AND business_id=?',(*vals,d['id'],b))
+                    db.execute('UPDATE products SET sku=?,barcode=?,name=?,description=?,category=?,unit=?,price=?,min_stock=?,perishable=?,active=?,current_cost=? WHERE id=? AND business_id=?',(*vals,d['id'],b))
                     db.execute('UPDATE products SET price_basis=? WHERE id=? AND business_id=?',(basis,d['id'],b))
-                else: result['id']=db.execute('INSERT INTO products(business_id,sku,barcode,name,description,category,unit,price,min_stock,perishable,active) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(b,*vals)).lastrowid
+                else: result['id']=db.execute('INSERT INTO products(business_id,sku,barcode,name,description,category,unit,price,min_stock,perishable,active,current_cost) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,*vals)).lastrowid
                 if not d.get('id'): db.execute('UPDATE products SET price_basis=? WHERE id=?',(basis,result['id']))
                 pid=int(d.get('id') or result['id']); max_stock=quantity(d.get('max_stock',0),unit); reorder=quantity(d.get('reorder_point',0),unit); lead=int(d.get('lead_time_days',3) or 0)
                 require(max_stock>=0 and reorder>=0 and 0<=lead<=365,'Revise los parámetros de reposición')
                 db.execute('UPDATE products SET max_stock=?,reorder_point=?,lead_time_days=? WHERE id=? AND business_id=?',(max_stock,reorder,lead,pid,b))
+                if cost_changed:
+                    open_lots=self.rows(db,'SELECT * FROM lots WHERE product_id=? AND business_id=? AND qty>0 ORDER BY id',(pid,b)); balance=sum(x['qty'] for x in open_lots); changed=now()
+                    for open_lot in open_lots:
+                        db.execute('UPDATE lots SET cost=?,cost_basis=? WHERE id=? AND business_id=?',(current_cost,basis,open_lot['id'],b))
+                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,pid,open_lot['id'],u['id'],changed,0,'Ajuste de costo','MAESTRO',current_cost,basis,balance,'Costo actualizado desde el maestro de productos'))
             elif action=='initial_stock':
                 self.admin(u); require(b==1,'La carga rápida de existencia inicial solo está disponible en mini market')
                 p=self.scoped(db,'products',d['product_id'],b); q=quantity(d['qty'],p['unit']); require(q>0,'Ingrese cantidad positiva')
@@ -344,6 +354,7 @@ class Store:
                 db.execute('UPDATE lots SET qty=qty-? WHERE id=?',(q,lot['id']))
                 balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(p['id'],)).fetchone()[0]
                 db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lot['id'],u['id'],now(),-q,'Ajuste negativo',reason,lot['cost'],lot['cost_basis'],balance,reason))
+                self.update_average(db,p); result.update(product_id=p['id'],available=balance)
             elif action=='customer':
                 require(clean(d.get('name')),'Indique el nombre del cliente'); email=clean(d.get('email')); require(not email or re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email),'Correo inválido')
                 credit_limit=money(d.get('credit_limit') or 0)

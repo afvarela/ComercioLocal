@@ -57,8 +57,8 @@ function drawLabelElement(context,element,articleRect,scale=2){
   if(!element)return;
   const rect=element.getBoundingClientRect(),style=getComputedStyle(element),x=(rect.left-articleRect.left)*scale,y=(rect.top-articleRect.top)*scale,w=rect.width*scale,h=rect.height*scale,fontSize=parseFloat(style.fontSize||"10")*scale;
   context.fillStyle="#000";context.textAlign="center";context.textBaseline="middle";context.font=`${style.fontWeight||400} ${fontSize}px Arial`;
-  const text=(element.textContent||"").trim(),words=text.split(/\s+/),lines=[];let line="";
-  for(const word of words){const candidate=line?`${line} ${word}`:word;if(context.measureText(candidate).width>w-4&&line){lines.push(line);line=word}else line=candidate}if(line)lines.push(line);
+  let text=(element.textContent||"").trim();if(style.textTransform==="uppercase")text=text.toUpperCase();const words=text.split(/\s+/),lines=[];let line="";
+  if(element.classList.contains("price"))lines.push(text);else{for(const word of words){const candidate=line?`${line} ${word}`:word;if(context.measureText(candidate).width>w-4&&line){lines.push(line);line=word}else line=candidate}if(line)lines.push(line)}
   const lineHeight=fontSize*1.08,start=y+h/2-(lines.length-1)*lineHeight/2;lines.slice(0,3).forEach((value,index)=>context.fillText(value,x+w/2,start+index*lineHeight,w-2));
 }
 function drawBarcode(context,container,articleRect,scale=2){
@@ -72,10 +72,10 @@ export async function printLabels(business, html) {
   const source=URL.createObjectURL(new Blob([html],{type:"text/html"}));frame.src=source;
   await new Promise((resolve,reject)=>{frame.onload=resolve;frame.onerror=reject});
   try{
-    const doc=frame.contentDocument,pages=[];
-    for(const article of doc.querySelectorAll("article")){
-      const rect=article.getBoundingClientRect(),width=Math.max(240,Math.ceil(rect.width*2)),height=Math.max(120,Math.ceil(rect.height*2)),canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const context=canvas.getContext("2d",{willReadFrequently:true});context.fillStyle="#fff";context.fillRect(0,0,width,height);
-      drawLabelElement(context,article.querySelector(".name"),rect);drawLabelElement(context,article.querySelector(".sku"),rect);drawLabelElement(context,article.querySelector(".price"),rect);drawBarcode(context,article.querySelector(".barcode"),rect);drawLabelElement(context,article.querySelector(".barcode-value"),rect);
+    const doc=frame.contentDocument,pages=[],main=doc.querySelector("main"),articles=[...doc.querySelectorAll("article")],columns=Math.max(1,Number(main?.dataset.columns)||1),mainRect=main.getBoundingClientRect(),pixelsPerMm=mainRect.width/(Number(main?.dataset.widthMm)||80),pageMargin=Math.max(0,Number(main?.dataset.pageMarginMm)||0)*pixelsPerMm;
+    for(let index=0;index<articles.length;index+=columns){
+      const row=articles.slice(index,index+columns),rects=row.map(article=>article.getBoundingClientRect()),firstTop=Math.min(...rects.map(rect=>rect.top)),top=firstTop-(index===0?pageMargin:0),nextTop=articles[index+columns]?.getBoundingClientRect().top,lastBottom=Math.max(...rects.map(rect=>rect.bottom)),bottom=(nextTop??lastBottom)+(index+columns>=articles.length?pageMargin:0),origin={left:mainRect.left,top},width=Math.max(160,Math.ceil(mainRect.width*2)),height=Math.max(40,Math.ceil((bottom-top)*2)),canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const context=canvas.getContext("2d",{willReadFrequently:true});context.fillStyle="#fff";context.fillRect(0,0,width,height);
+      for(const article of row){drawLabelElement(context,article.querySelector(".name"),origin);drawLabelElement(context,article.querySelector(".price"),origin);drawBarcode(context,article.querySelector(".barcode"),origin);drawLabelElement(context,article.querySelector(".barcode-value"),origin);}
       const rgba=context.getImageData(0,0,width,height).data,gray=new Uint8Array(width*height);for(let i=0,j=0;i<rgba.length;i+=4,j++)gray[j]=rgba[i]*.299+rgba[i+1]*.587+rgba[i+2]*.114;
       let binary="";for(let i=0;i<gray.length;i+=32768)binary+=String.fromCharCode(...gray.subarray(i,i+32768));pages.push({width,height,pixels:btoa(binary)});
     }

@@ -188,6 +188,13 @@ export default function OperationForm({
             label={`Precio final por ${base(unit, basis)}`}
             defaultValue={(product.price || 0) / 100}
           />
+          {id && (
+            <MoneyField
+              name="current_cost"
+              label={`Costo actual por ${base(unit, basis)}`}
+              defaultValue={(product.current_cost || 0) / 100}
+            />
+          )}
           <Field
             name="min_stock"
             label={`Stock mínimo en ${unit}`}
@@ -214,6 +221,7 @@ export default function OperationForm({
             <div className="field">
               <label>Estado del producto</label>
               <label className="check">
+                <input type="hidden" name="active" value="" />
                 <input type="checkbox" name="active" value="1" defaultChecked={!!product.active} />
                 Producto activo y visible en el punto de venta
               </label>
@@ -226,6 +234,7 @@ export default function OperationForm({
               defaultValue={product.description || ""}
             />
           </div>
+          {id && <p className="print-note wide">Si cambias el costo, se actualizará la valoración de los lotes que todavía tienen existencia. Las compras y ventas anteriores conservarán su costo histórico.</p>}
         </div>
       );
       break;
