@@ -75,6 +75,38 @@ test('D1 conserva el estado activo al editar un producto y solo lo cambia de for
   assert.equal(waste.cost,450000);assert.equal(waste.balance_after,8);
 });
 
+test('D1 guarda el costo de recepción y actualiza el costo promedio del producto',async()=>{
+  const db=new SQLiteD1();
+  db.db.exec(`
+    CREATE TABLE cloud_revision(id INTEGER PRIMARY KEY,version INTEGER NOT NULL);
+    INSERT INTO cloud_revision VALUES(1,0);
+    CREATE TABLE products(id INTEGER PRIMARY KEY,business_id INTEGER,sku TEXT,barcode TEXT,name TEXT,description TEXT,category TEXT,unit TEXT,price INTEGER,min_stock INTEGER,max_stock INTEGER,reorder_point INTEGER,lead_time_days INTEGER,perishable INTEGER,active INTEGER,price_basis INTEGER,current_cost INTEGER);
+    INSERT INTO products VALUES(1,1,'ACEITE-1',NULL,'Aceite','', 'Mercado', 'und',500000,0,0,0,3,0,1,1,0);
+    CREATE TABLE lots(id INTEGER PRIMARY KEY,business_id INTEGER,product_id INTEGER,code TEXT,expires TEXT,qty INTEGER,cost INTEGER,cost_basis INTEGER,supplier TEXT,reference TEXT,created TEXT,original_qty INTEGER,purchase_id INTEGER,status TEXT);
+    CREATE TABLE purchases(id INTEGER PRIMARY KEY,business_id INTEGER,number INTEGER,supplier TEXT,reference TEXT,created TEXT,user_id INTEGER,total INTEGER,status TEXT,note TEXT,request_id TEXT);
+    CREATE TABLE purchase_lines(id INTEGER PRIMARY KEY,purchase_id INTEGER,product_id INTEGER,lot_id INTEGER,qty INTEGER,returned_qty INTEGER DEFAULT 0,cost INTEGER,cost_basis INTEGER,total INTEGER);
+    CREATE TABLE stock_moves(id INTEGER PRIMARY KEY,business_id INTEGER,product_id INTEGER,lot_id INTEGER,user_id INTEGER,created TEXT,qty INTEGER,kind TEXT,reference TEXT,cost INTEGER,cost_basis INTEGER,balance_after INTEGER,note TEXT);
+    CREATE TABLE audit(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,created TEXT,action TEXT,detail TEXT);
+  `);
+  const user={id:3,role:'admin'};
+  const first=await storeCommand(db,user,1,'receive',{product_id:1,qty:10,cost:2500,sale_price:5500,supplier:'Proveedor A',reference:'FAC-1'});
+  assert.equal(first.current_cost,250000);
+  assert.equal(db.db.prepare('SELECT cost FROM lots WHERE id=?').get(first.id).cost,250000);
+  assert.equal(db.db.prepare('SELECT current_cost FROM products WHERE id=1').get().current_cost,250000);
+  assert.equal(db.db.prepare('SELECT total FROM purchases WHERE id=?').get(first.purchase_id).total,2500000);
+  assert.deepEqual(
+    {...db.db.prepare('SELECT cost,total FROM purchase_lines WHERE purchase_id=?').get(first.purchase_id)},
+    {cost:250000,total:2500000},
+  );
+  const movement=db.db.prepare("SELECT cost,balance_after FROM stock_moves WHERE kind='Compra'").get();
+  assert.deepEqual({...movement},{cost:250000,balance_after:10});
+
+  const second=await storeCommand(db,user,1,'receive',{product_id:1,qty:10,cost:3500,sale_price:5500,supplier:'Proveedor B',reference:'FAC-2'});
+  assert.equal(second.current_cost,300000);
+  assert.equal(db.db.prepare('SELECT current_cost FROM products WHERE id=1').get().current_cost,300000);
+  assert.deepEqual(db.db.prepare('SELECT cost FROM lots ORDER BY id').all().map(row=>row.cost),[250000,350000]);
+});
+
 test('D1 guarda En reparto, Entregado y la reapertura del despacho',async()=>{
   const db=new LogisticsD1(),user={id:3,role:'admin'};
   await logisticsCommand(db,user,1,'status',{id:7,status:'En reparto'});

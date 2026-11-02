@@ -479,11 +479,17 @@ export default function App() {
       payload.active = id ? Boolean(d.active) : true;
     }
     const result = await command(type, payload);
-    if (type === "waste" || type === "product") {
+    if (["waste", "product", "receive"].includes(type)) {
       close();
       try {
-        await refresh(business, start, end, { details: true, history: type === "waste" });
-        toast(type === "waste" ? "Merma registrada e inventario actualizado" : "Producto actualizado correctamente");
+        await refresh(business, start, end, { details: true, history: type !== "product" });
+        toast(
+          type === "waste"
+            ? "Merma registrada e inventario actualizado"
+            : type === "receive"
+              ? "Mercancía recibida y costo actualizado"
+              : "Producto actualizado correctamente",
+        );
       } catch {
         toast("Los datos se guardaron. Recarga la pantalla para actualizar el inventario.");
       }

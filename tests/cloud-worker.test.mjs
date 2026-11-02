@@ -471,7 +471,7 @@ test("Cloudflare genera codigos de barras SVG reales para las etiquetas", () => 
 test("inventario cierra la merma antes de refrescar y permite editar el costo", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
-  assert.match(app, /type === "waste" \|\| type === "product"/);
+  assert.match(app, /\["waste", "product", "receive"\]\.includes\(type\)/);
   assert.match(app, /close\(\);[\s\S]{0,100}await refresh/);
   assert.match(form, /name="current_cost"/);
   assert.match(form, /Las compras y ventas anteriores conservarán su costo histórico/);

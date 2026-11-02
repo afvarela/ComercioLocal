@@ -256,7 +256,12 @@ export default function OperationForm({
             <Field name="code" label="Numero de lote (opcional)" placeholder="Se genera automaticamente si se deja vacio" />
             <Field name="expires" label="Fecha de vencimiento (opcional)" type="date" />
             <Field name="qty" label={`Cantidad en ${receiving?.unit || "unidades"}`} type="number" min={receiving?.unit === "m" ? 0.001 : 1} step={receiving?.unit === "m" ? 0.001 : 1} required />
-            <MoneyField name="cost" label={`Costo por ${base(receiving?.unit, receiving?.price_basis)}`} defaultValue="0" />
+            <MoneyField
+              key={`cost-${selectedProduct}`}
+              name="cost"
+              label={`Costo por ${base(receiving?.unit, receiving?.price_basis)}`}
+              defaultValue={(receiving?.current_cost || 0) / 100}
+            />
             <MoneyField key={`sale-price-${selectedProduct}`} name="sale_price" label={`Nuevo precio de venta por ${base(receiving?.unit, receiving?.price_basis)}`} defaultValue={(receiving?.price || 0) / 100} />
             <Field name="supplier" label="Proveedor (opcional)" />
             <Field name="reference" label="Factura de compra / remision (opcional)" />

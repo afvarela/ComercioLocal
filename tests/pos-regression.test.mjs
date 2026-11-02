@@ -27,6 +27,15 @@ test("los formularios del POS no dependen del historial completo", () => {
   assert.doesNotMatch(source, /history\.debts\.find/);
 });
 
+test("la recepción vuelve a mostrar el costo guardado y refresca el inventario", () => {
+  const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  assert.match(form, /key=\{`cost-\$\{selectedProduct\}`\}/);
+  assert.match(form, /defaultValue=\{\(receiving\?\.current_cost \|\| 0\) \/ 100\}/);
+  assert.match(app, /\["waste", "product", "receive"\]\.includes\(type\)/);
+  assert.match(app, /Mercancía recibida y costo actualizado/);
+});
+
 test("cantidad y producto no registrado renderizan con history nulo", async () => {
   const entry = `
     import React from "react";
