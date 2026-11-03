@@ -378,6 +378,7 @@ export function Labels({ business, admin }) {
     });
     if (print) {
       await printLabels(business, html);
+      setItems([]);
       setMessage("Etiquetas enviadas directamente a la impresora");
     }
   }

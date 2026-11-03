@@ -107,6 +107,67 @@ test('D1 guarda el costo de recepción y actualiza el costo promedio del product
   assert.deepEqual(db.db.prepare('SELECT cost FROM lots ORDER BY id').all().map(row=>row.cost),[250000,350000]);
 });
 
+test('D1 crea clientes offline de forma idempotente',async()=>{
+  const db=new SQLiteD1();
+  db.db.exec(`
+    CREATE TABLE cloud_revision(id INTEGER PRIMARY KEY,version INTEGER NOT NULL);
+    INSERT INTO cloud_revision VALUES(1,0);
+    CREATE TABLE customers(id INTEGER PRIMARY KEY,business_id INTEGER,name TEXT,document TEXT,phone TEXT,email TEXT,credit_limit INTEGER,request_id TEXT);
+    CREATE UNIQUE INDEX idx_customers_offline_request ON customers(business_id,request_id) WHERE request_id IS NOT NULL;
+    CREATE TABLE audit(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,created TEXT,action TEXT,detail TEXT);
+  `);
+  const payload={name:'Cliente offline',document:'123',credit_limit:0,request_id:'cliente-offline-123456'};
+  const first=await storeCommand(db,{id:3,role:'admin'},1,'customer',payload);
+  const second=await storeCommand(db,{id:3,role:'admin'},1,'customer',payload);
+  assert.equal(first.id,second.id);
+  assert.equal(db.db.prepare('SELECT COUNT(*) count FROM customers').get().count,1);
+});
+
+test('D1 permite abonar antes del vencimiento y bloquea pagos superiores',async()=>{
+  const db=new SQLiteD1();
+  db.db.exec(`
+    CREATE TABLE cloud_revision(id INTEGER PRIMARY KEY,version INTEGER NOT NULL);
+    INSERT INTO cloud_revision VALUES(1,0);
+    CREATE TABLE cash_sessions(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,closed TEXT,opening INTEGER);
+    INSERT INTO cash_sessions VALUES(1,1,3,NULL,0);
+    CREATE TABLE sales(id INTEGER PRIMARY KEY,business_id INTEGER,status TEXT,debt INTEGER,due TEXT);
+    INSERT INTO sales VALUES(8,1,'active',1000000,'2099-12-31');
+    CREATE TABLE receivables(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,sale_id INTEGER,paid_amount INTEGER,balance INTEGER,status TEXT);
+    INSERT INTO receivables VALUES(5,1,4,8,0,1000000,'Pendiente');
+    CREATE TABLE payments(id INTEGER PRIMARY KEY,business_id INTEGER,sale_id INTEGER,cash_id INTEGER,user_id INTEGER,created TEXT,method TEXT,amount INTEGER,kind TEXT,reference TEXT);
+    CREATE TABLE cash_moves(id INTEGER PRIMARY KEY,cash_id INTEGER,amount INTEGER);
+    CREATE TABLE receivable_moves(id INTEGER PRIMARY KEY,receivable_id INTEGER,business_id INTEGER,customer_id INTEGER,sale_id INTEGER,payment_id INTEGER,created TEXT,kind TEXT,amount INTEGER,balance_after INTEGER,user_id INTEGER,note TEXT,request_id TEXT);
+    CREATE TABLE audit(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,created TEXT,action TEXT,detail TEXT);
+  `);
+  const user={id:3,role:'admin'};
+  await storeCommand(db,user,1,'repay',{sale_id:8,amount:4000,method:'Nequi',request_id:'abono-futuro-1'});
+  assert.equal(db.db.prepare('SELECT debt FROM sales WHERE id=8').get().debt,600000);
+  await assert.rejects(storeCommand(db,user,1,'repay',{sale_id:8,amount:6001,method:'Efectivo',request_id:'abono-futuro-2'}),/Abono o medio inválido/);
+  await storeCommand(db,user,1,'repay',{sale_id:8,amount:6000,method:'Efectivo',request_id:'abono-futuro-3'});
+  assert.deepEqual({...db.db.prepare('SELECT paid_amount,balance,status FROM receivables WHERE id=5').get()},{paid_amount:1000000,balance:0,status:'Pagado'});
+});
+
+test('D1 repara una venta fiada antigua sin receivable antes de cobrar',async()=>{
+  const db=new SQLiteD1();
+  db.db.exec(`
+    CREATE TABLE cloud_revision(id INTEGER PRIMARY KEY,version INTEGER NOT NULL); INSERT INTO cloud_revision VALUES(1,0);
+    CREATE TABLE cash_sessions(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,closed TEXT,opening INTEGER); INSERT INTO cash_sessions VALUES(1,1,3,NULL,0);
+    CREATE TABLE customers(id INTEGER PRIMARY KEY,business_id INTEGER,name TEXT); INSERT INTO customers VALUES(4,1,'Cliente legado');
+    CREATE TABLE sales(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,debt INTEGER,original_debt INTEGER,status TEXT,created TEXT,user_id INTEGER);
+    INSERT INTO sales VALUES(8,1,4,1000000,1000000,'active','2026-11-03T10:00:00Z',3);
+    CREATE TABLE receivables(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,sale_id INTEGER,created TEXT,original_amount INTEGER,paid_amount INTEGER,returned_amount INTEGER,balance INTEGER,status TEXT);
+    CREATE TABLE collections(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,cash_id INTEGER,user_id INTEGER,created TEXT,amount INTEGER,method TEXT,reference TEXT,request_id TEXT);
+    CREATE TABLE collection_allocations(id INTEGER PRIMARY KEY,collection_id INTEGER,receivable_id INTEGER,sale_id INTEGER,amount INTEGER,balance_after INTEGER);
+    CREATE TABLE payments(id INTEGER PRIMARY KEY,business_id INTEGER,sale_id INTEGER,cash_id INTEGER,user_id INTEGER,created TEXT,method TEXT,amount INTEGER,kind TEXT,reference TEXT);
+    CREATE TABLE receivable_moves(id INTEGER PRIMARY KEY,receivable_id INTEGER,business_id INTEGER,customer_id INTEGER,sale_id INTEGER,payment_id INTEGER,created TEXT,kind TEXT,amount INTEGER,balance_after INTEGER,user_id INTEGER,note TEXT,request_id TEXT);
+    CREATE TABLE audit(id INTEGER PRIMARY KEY,business_id INTEGER,user_id INTEGER,created TEXT,action TEXT,detail TEXT);
+  `);
+  const result=await storeCommand(db,{id:3,role:'admin'},1,'customer_payment',{customer_id:4,amount:4000,method:'Nequi',request_id:'legacy-payment-123456'});
+  assert.ok(result.id);
+  assert.deepEqual({...db.db.prepare('SELECT original_amount,paid_amount,balance,status FROM receivables WHERE sale_id=8').get()},{original_amount:1000000,paid_amount:400000,balance:600000,status:'Parcialmente pagado'});
+  assert.equal(db.db.prepare('SELECT debt FROM sales WHERE id=8').get().debt,600000);
+});
+
 test('D1 guarda En reparto, Entregado y la reapertura del despacho',async()=>{
   const db=new LogisticsD1(),user={id:3,role:'admin'};
   await logisticsCommand(db,user,1,'status',{id:7,status:'En reparto'});

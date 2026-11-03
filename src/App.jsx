@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api, downloadInvoicePdf, pendingSales, syncPendingSales, syncProductCatalog, projectOfflineState } from "./lib/api.js";
-import { printReceipt, printOfflineSale } from "./lib/printer.js";
+import { printReceipt, printOfflineSale, printAccountStatement } from "./lib/printer.js";
 import {
   cop,
   cartTotal,
+  lineTotal,
   qty,
   stockLabel,
   localDate,
@@ -48,6 +49,25 @@ const navigation = [
   ["reports", "◷", "Reportes"],
   ["settings", "⚙", "Configuración"],
 ];
+const inventoryWriteActions = new Set([
+  "new_product",
+  "edit_product",
+  "receive",
+  "initial_stock",
+  "waste",
+  "manual_purchase_return",
+  "purchase_return",
+  "void_purchase",
+]);
+const inventoryWriteForms = new Set([
+  "product",
+  "receive",
+  "initial_stock",
+  "waste",
+  "manual_purchase_return",
+  "purchase_return",
+  "void_purchase",
+]);
 function Brand() {
   return (
     <div className="brand">
@@ -269,7 +289,7 @@ export default function App() {
       queueChanged();
       if (result.synced) {
         toast(`${result.synced} operación(es) pendientes sincronizadas`);
-        try { await refresh(); } catch {}
+        try { await refresh(business, start, end, { customers: true }); } catch {}
       }
     };
     const disconnected = () => setOnline(false);
@@ -410,6 +430,8 @@ export default function App() {
   }
   async function saveForm(d) {
     const { type, id } = modal;
+    if ((state.degraded || !online) && inventoryWriteForms.has(type))
+      throw Error("Inventario bloqueado mientras la aplicación trabaja en modo local. Espera a recuperar la conexión y la sincronización con D1.");
     if (type === "quantity") {
       const p = modal.product,
         raw = Number(d.qty) * (["m","litro","libra"].includes(p.unit) ? 1000 : 1),
@@ -451,12 +473,13 @@ export default function App() {
     }
     let payload = { ...d };
     if (type === "product") payload = { ...d, id, perishable: !!d.perishable, active: id ? !!d.active : true };
-    if (type === "customer") payload = { ...d, id };
+    if (type === "customer") payload = { ...d, id, request_id: id ? undefined : modal.requestId };
     if (type === "unregistered_option") payload = { ...d, id, active: id ? !!d.active : true };
     if (type === "customer_payment") {
       const allocations=Object.entries(d).filter(([key,value])=>key.startsWith("invoice_")&&Number(value)>0).map(([key,value])=>({sale_id:Number(key.slice(8)),amount:Number(value)}));
       payload={customer_id:Number(d.customer_id),amount:allocations.length?allocations.reduce((sum,item)=>sum+item.amount,0):Number(d.amount),method:d.method,reference:d.reference,allocations,request_id:modal.requestId};
     }
+    if (type === "cash_nequi_review") payload = { ...d, amount: d.decision === "adjust" ? Number(d.amount || 0) : 0, reason: d.decision === "adjust" ? d.reason : "", request_id: modal.requestId };
     if (type === "waste") payload.lot_id = id;
     if (type === "repay" || type === "email" || type === "void_sale")
       payload.sale_id = id;
@@ -464,7 +487,7 @@ export default function App() {
     if (type === "void_purchase") payload.purchase_id = id;
     if (type === "purchase_return") payload.purchase_line_id = id;
     if (type === "sale_return") payload.sale_id = id;
-    if (["repay", "customer_payment", "purchase_return", "manual_purchase_return", "sale_return"].includes(type))
+    if (["repay", "customer_payment", "cash_nequi_review", "purchase_return", "manual_purchase_return", "sale_return"].includes(type))
       payload.request_id = modal.requestId;
     if (type === "quote")
       payload = {
@@ -479,6 +502,12 @@ export default function App() {
       payload.active = id ? Boolean(d.active) : true;
     }
     const result = await command(type, payload);
+    if (type === "cash_nequi_review") {
+      close();
+      await refresh();
+      toast(d.decision === "adjust" ? "Salida de efectivo registrada. Ya puedes revisar y cerrar la caja." : "Revisión de Nequi confirmada. Ya puedes cerrar la caja.");
+      return;
+    }
     if (["waste", "product", "receive"].includes(type)) {
       close();
       try {
@@ -543,6 +572,16 @@ export default function App() {
       total: cartTotal(saleCart),
       operator: state.user.name,
       customer: state.customers.find((customer) => customer.id === Number(payload.customer_id))?.name || null,
+      items: saleCart.map((item) => ({
+        name: item.name,
+        note: item.note || "",
+        unregistered: Boolean(item.unregistered),
+        qty: item.qty,
+        unit: item.unit,
+        price: item.price,
+        price_basis: item.price_basis,
+        total: lineTotal(item),
+      })),
     };
     // Solo la escritura de la venta bloquea el diálogo. Impresión y refresco continúan en segundo plano.
     const r = await command("sale", payload);
@@ -595,6 +634,10 @@ export default function App() {
   }
   async function action(a, id) {
     try {
+      if ((state.degraded || !online) && inventoryWriteActions.has(a)) {
+        toast("Inventario bloqueado en modo local. Puedes seguir vendiendo; realiza este cambio cuando D1 vuelva a estar sincronizado.", "error", 5000);
+        return;
+      }
       switch (a) {
         case "price_required":
           toast("El administrador debe asignar el precio en Inventario");
@@ -649,6 +692,30 @@ export default function App() {
           if (!cart.length) return;
           form(state.cash ? "checkout" : "open_cash");
           break;
+        case "close_cash":
+          form(state.cash?.nequi_review_required ? "cash_nequi_review" : "close_cash");
+          break;
+        case "cash_nequi_adjustment":
+          form("cash_nequi_review", null, { forceAdjustment: true });
+          break;
+        case "customer_statement": {
+          const customer = state.customers.find((item) => Number(item.id) === Number(id));
+          let statement;
+          try { statement = await api(business, `/api/customer-statement?id=${id}`); }
+          catch { statement = { customer, sales: [], total_credit: 0, payments: 0, returns: 0, balance: 0 }; }
+          for (const pending of pendingSales().filter((item) => item.business === business && item.action === "sale" && Number(item.data?.data?.customer_id) === Number(id))) {
+            if (statement.sales?.some((sale) => sale.request_id === pending.requestId || String(sale.id) === String(pending.requestId))) continue;
+            const data=pending.data.data,meta=data._offline||{},total=Number(meta.total||0),paid=(data.payments||[]).reduce((sum,payment)=>sum+Math.round(Number(payment.amount||0)*100),0),debt=Math.max(0,total-paid);
+            if (!debt) continue;
+            statement.sales.push({id:pending.requestId,request_id:pending.requestId,number:"LOCAL",created:pending.created,original_debt:debt,debt,paid_amount:0,returned_amount:0,lines:meta.items||[]});
+            statement.total_credit+=debt;statement.balance+=debt;
+          }
+          if (!statement.sales?.length) throw Error("El cliente no tiene compras fiadas para imprimir");
+          const businessName = state.businesses.find((item) => item.id === business)?.name || "Comercio Local";
+          await printAccountStatement(businessName, statement);
+          toast("Estado de cuenta enviado a la impresora");
+          break;
+        }
         case "save_quote":
           if (!cart.length) {
             toast("Agrega productos antes de guardar la cotización");
@@ -748,6 +815,23 @@ export default function App() {
           setDispatchSaleId(id);
           setView("dispatches");
           break;
+        case "print_offline_sale": {
+          const pendingSale = pendingSales().find((item) => item.business === business && item.action === "sale" && item.requestId === id);
+          if (!pendingSale) throw Error("La venta local ya no está pendiente o ya fue sincronizada");
+          const data = pendingSale.data.data;
+          const meta = data._offline || {};
+          await printOfflineSale({
+            businessName: business === 1 ? "MINI MARKET" : "FERRETERIA",
+            requestId: pendingSale.requestId,
+            cart: meta.items || [],
+            payments: data.payments || [],
+            total: Number(meta.total || 0),
+            cashReceived: data.cash_received,
+            change: data.change_given,
+          });
+          toast("Recibo local enviado a la impresora");
+          break;
+        }
         case "logout":
           if (cart.length) {
             toast("Termina o vacía la venta actual antes de cerrar sesión");
@@ -796,6 +880,7 @@ export default function App() {
     start,
     end,
     onDates: dates,
+    inventoryLocked: state.degraded || !online,
   };
   const pages = {
     inventory: Inventory,
@@ -874,7 +959,7 @@ export default function App() {
                 if (!navigator.onLine) return toast("Sin conexión. Las operaciones siguen guardadas en este equipo.");
                 const result = await syncPendingSales();
                 setPending(result.pending);
-                if (result.synced) await refresh();
+                if (result.synced) await refresh(business, start, end, { customers: true });
                 toast(result.pending ? `${result.pending} operación(es) aún pendientes` : "Sincronización al día");
               }}
             >

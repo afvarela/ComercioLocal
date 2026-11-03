@@ -97,7 +97,7 @@ test("status solicita configuracion cuando D1 no tiene usuarios", async () => {
   const { env } = environment();
   const response = await worker.fetch(new Request("https://comercio.example/api/status"), env);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { setup: true, cloud: true, version: "3.3.6" });
+  assert.deepEqual(await response.json(), { setup: true, cloud: true, version: "3.3.8" });
 });
 
 test("el primer administrador se crea solamente con un PIN de cuatro numeros", async () => {
@@ -515,6 +515,18 @@ test("Cloudflare expone el recibo de texto que necesita la impresora POS", () =>
     const printable = line.replace(/^\[\[[A-Z_]+\]\]/, "");
     assert.ok(printable.length <= 38, `la línea excede el ancho POS: ${printable}`);
   }
+});
+
+test("el recibo cloud de cierre conserva signos y trazabilidad de la salida", () => {
+  const html = '<style>body{width:72mm}</style><header><h1>TIENDA</h1><p>900<br>Dirección<br>313</p><h2>Cierre de caja</h2><b>CAJA-1</b></header><p>2026-11-03T15:00:00Z<br>Atendió: Ana</p><p class="cash-row cash-heading"><span>RESUMEN DE VENTAS</span><strong></strong></p><p class="cash-row cash-total"><span>TOTAL VENTAS</span><strong>$ 150.000</strong></p><p class="cash-row"><span>Ventas en efectivo</span><strong>$ 50.000</strong></p><p class="cash-row"><span>Salida / traslado de efectivo<small>Pago proveedor quesos<br>2026-11-03T14:00:00Z · Ana</small></span><strong>- $ 80.000</strong></p><p class="cash-row cash-total"><span>EFECTIVO ESPERADO (SIN BASE)</span><strong>- $ 30.000</strong></p><p class="cash-row"><span>Base de apertura</span><strong>+ $ 100.000</strong></p><p class="cash-row cash-total"><span>TOTAL A CONTAR EN CAJA</span><strong>$ 70.000</strong></p>';
+  const text = receiptPlainText(html);
+  assert.match(text,/TOTAL VENTAS/);
+  assert.match(text,/Ventas en efectivo/);
+  assert.match(text,/Salida \/ traslado/);
+  assert.match(text,/Pago proveedor/);
+  assert.match(text,/Ana/);
+  assert.match(text,/Total a contar en caja/i);
+  assert.doesNotMatch(text,/control|no es efectivo/i);
 });
 
 

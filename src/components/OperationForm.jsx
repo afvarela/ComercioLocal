@@ -41,6 +41,7 @@ export default function OperationForm({
     type === "receive" ? "" : products[0]?.id || "",
   );
   const [receiveSearch, setReceiveSearch] = useState("");
+  const [cashDecision, setCashDecision] = useState(config.forceAdjustment ? "adjust" : "");
   const returnLines = config.sale?.lines ||
     (safeHistory.sale_lines || []).filter((line) => Number(line.sale_id) === Number(id));
   const [selectedSaleLine, setSelectedSaleLine] = useState(returnLines[0]?.id || "");
@@ -48,6 +49,9 @@ export default function OperationForm({
   const receiving = products.find(
     (p) => p.id === Number(selectedProduct),
   );
+  const receivingBase = receiving
+    ? base(receiving.unit, receiving.price_basis)
+    : "unidad";
   const receivingVegetable = business === 1 && receiving?.category === "Verduras";
   let title = "",
     body = null,
@@ -259,10 +263,10 @@ export default function OperationForm({
             <MoneyField
               key={`cost-${selectedProduct}`}
               name="cost"
-              label={`Costo por ${base(receiving?.unit, receiving?.price_basis)}`}
+              label={`Costo por ${receivingBase}`}
               defaultValue={(receiving?.current_cost || 0) / 100}
             />
-            <MoneyField key={`sale-price-${selectedProduct}`} name="sale_price" label={`Nuevo precio de venta por ${base(receiving?.unit, receiving?.price_basis)}`} defaultValue={(receiving?.price || 0) / 100} />
+            <MoneyField key={`sale-price-${selectedProduct}`} name="sale_price" label={`Nuevo precio de venta por ${receivingBase}`} defaultValue={(receiving?.price || 0) / 100} />
             <Field name="supplier" label="Proveedor (opcional)" />
             <Field name="reference" label="Factura de compra / remision (opcional)" />
           </div>
@@ -461,15 +465,38 @@ export default function OperationForm({
         </>
       );
       break;
+    case "cash_nequi_review":
+      title = "Revisar efectivo y pagos por Nequi";
+      submit = cashDecision === "adjust" ? "Registrar salida" : "Confirmar revisión";
+      body = (
+        <>
+          <Notice info>
+            Pagos recibidos por Nequi en esta caja: <b>{cop(state.cash?.nequi_total || 0)}</b>.
+            Una salida solo debe registrarse si realmente retiraste efectivo, por ejemplo para pagar a un proveedor.
+          </Notice>
+          <Select name="decision" label="¿Qué deseas hacer?" value={cashDecision} onChange={(event) => setCashDecision(event.target.value)} required>
+            <option value="">Selecciona una opción</option>
+            <option value="adjust">Registrar una salida real de efectivo</option>
+            <option value="continue">Continuar sin salida de efectivo</option>
+          </Select>
+          {cashDecision === "adjust" && <>
+            <MoneyField name="amount" label="Efectivo retirado" defaultValue="0" />
+            <Field name="reason" label="Motivo real / proveedor / soporte" placeholder="Ejemplo: pago en efectivo al proveedor de quesos" required />
+            <label className="check"><input type="checkbox" required /> Confirmo que este dinero salió físicamente de la caja</label>
+          </>}
+        </>
+      );
+      break;
     case "close_cash":
       title = "Arqueo y cierre de caja";
       submit = "Confirmar cierre";
       body = (
         <>
           <Notice info>
-            Efectivo esperado: <b>{cop(state.cash?.expected)}</b>. Cuenta solo
-            billetes y monedas. Los medios electrónicos aparecen separados en el
-            recibo.
+            Efectivo esperado sin base: <b>{cop(state.cash?.expected_without_opening || 0)}</b>.<br />
+            Base de apertura: <b>{cop(state.cash?.opening || 0)}</b>.<br />
+            Total a contar en caja: <b>{cop(state.cash?.expected_total ?? state.cash?.expected)}</b>.
+            Cuenta billetes y monedas; Nequi y fiados no se suman al efectivo.
           </Notice>
           <MoneyField
             name="counted"

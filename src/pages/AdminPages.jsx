@@ -19,6 +19,7 @@ import {
   base,
   saleNumber,
   normalize,
+  colombiaDate,
   gainMargin,
   methods,
 } from "../lib/format.js";
@@ -132,16 +133,21 @@ function PrinterSettings() {
 }
 export function Inventory({
   state,
-  history,
+  history = {},
   business,
   admin,
   onAction,
   start,
   end,
   onDates,
+  inventoryLocked = false,
 }) {
   const [tab, setTab] = useState("products"),
-    [search, setSearch] = useState(""), [categoryFilter,setCategoryFilter]=useState(""), [statusFilter,setStatusFilter]=useState("active");
+    [search, setSearch] = useState(""),
+    [categoryFilter,setCategoryFilter]=useState(""),
+    [statusFilter,setStatusFilter]=useState("active"),
+    [moveSearch,setMoveSearch]=useState(""),
+    [moveType,setMoveType]=useState("");
   const inventoryProducts = [...state.products, ...(state.inactive_products || [])];
   const near = state.lots.filter(
       (l) => l.expires && l.expires <= localDate(30),
@@ -153,6 +159,12 @@ export function Inventory({
       (!categoryFilter || p.category === categoryFilter) &&
       matchesProductSearch(p, search),
   );
+  const movementTypes = [...new Set((history.stock_moves || []).map((movement) => movement.kind).filter(Boolean))].sort();
+  const filteredMoves = (history.stock_moves || []).filter((movement) => {
+    const needle = normalize(moveSearch);
+    const matchesText = !needle || normalize(`${movement.name || ""} ${movement.code || ""} ${movement.reference || ""} ${movement.operator || ""} ${movement.note || ""}`).includes(needle);
+    return matchesText && (!moveType || movement.kind === moveType);
+  });
   return (
     <>
       <Head
@@ -162,23 +174,24 @@ export function Inventory({
         {admin && (
           <>
             <a className="export-button" href={`/api/inventory.xlsx?business=${business}&category=${encodeURIComponent(categoryFilter)}&search=${encodeURIComponent(search)}`}>Descargar Inventario Disponible (.xlsx)</a>
-            <Button primary onClick={() => onAction("new_product")}>
+            <Button primary disabled={inventoryLocked} onClick={() => onAction("new_product")}>
               + Nuevo producto
             </Button>
-            <Button onClick={() => onAction("receive")}>
+            <Button disabled={inventoryLocked} onClick={() => onAction("receive")}>
               Recibir mercancía
             </Button>
             {business === 1 && (
-              <Button accent onClick={() => onAction("initial_stock")}>
+              <Button accent disabled={inventoryLocked} onClick={() => onAction("initial_stock")}>
                 + Existencia inicial rápida
               </Button>
             )}
-            <Button onClick={() => onAction("manual_purchase_return")}>
+            <Button disabled={inventoryLocked} onClick={() => onAction("manual_purchase_return")}>
               Devolución manual a proveedor
             </Button>
           </>
         )}
       </Head>
+      {inventoryLocked && <Notice>Inventario bloqueado temporalmente: la aplicación está trabajando con datos locales porque D1 no responde o la conexión está inestable. Puedes seguir facturando; vuelve a intentar las modificaciones de inventario cuando aparezca “En línea · sincronizado”.</Notice>}
       <Metrics
         items={[
           {
@@ -222,7 +235,13 @@ export function Inventory({
               </button>
             ))}
         </div>
-        {tab === "moves" || tab === "purchases" ? (
+        {tab === "moves" ? (
+          <div className="report-filter-bar movement-filter-bar">
+            <DateRange start={start} end={end} onApply={onDates} />
+            <Field name="movement_search" label="Buscar movimiento" value={moveSearch} onChange={(event) => setMoveSearch(event.target.value)} placeholder="Producto, lote, documento o usuario" />
+            <label className="field">Tipo de movimiento<select value={moveType} onChange={(event) => setMoveType(event.target.value)}><option value="">Todos</option>{movementTypes.map((kind) => <option key={kind}>{kind}</option>)}</select></label>
+          </div>
+        ) : tab === "purchases" ? (
           <DateRange start={start} end={end} onApply={onDates} />
         ) : (
           <div className="inventory-filters"><select aria-label="Filtrar estado" value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}><option value="active">Activos</option><option value="inactive">Desactivados</option><option value="all">Todos</option></select><select aria-label="Filtrar categoría" value={categoryFilter} onChange={e=>setCategoryFilter(e.target.value)}><option value="">Todas las categorías</option>{[...new Set(inventoryProducts.map(p=>p.category).filter(Boolean))].map(x=><option key={x}>{x}</option>)}</select><input
@@ -248,7 +267,7 @@ export function Inventory({
                 dt(p.created),
                 cop(p.total),
                 <Badge tone={p.status === "Anulada" ? "red" : ""}>{p.status}</Badge>,
-                p.status === "Activa" ? <Button className="danger" onClick={() => onAction("void_purchase", p.id)}>Anular compra</Button> : "—",
+                p.status === "Activa" ? <Button disabled={inventoryLocked} className="danger" onClick={() => onAction("void_purchase", p.id)}>Anular compra</Button> : "—",
               ])}
             />
             <div className="section-title"><h2>Productos comprados</h2></div>
@@ -260,7 +279,7 @@ export function Inventory({
                 stockLabel(l.qty, l.unit),
                 stockLabel(l.returned_qty, l.unit),
                 cop(l.cost) + " / " + base(l.unit, l.cost_basis),
-                l.purchase_status !== "Anulada" && l.returned_qty < l.qty ? <Button onClick={() => onAction("purchase_return", l.id)}>Devolver al proveedor</Button> : "—",
+                l.purchase_status !== "Anulada" && l.returned_qty < l.qty ? <Button disabled={inventoryLocked} onClick={() => onAction("purchase_return", l.id)}>Devolver al proveedor</Button> : "—",
               ])}
             />
             <div className="section-title"><h2>Documentos de devolución</h2></div>
@@ -316,7 +335,7 @@ export function Inventory({
                 ...(admin
                   ? [
                       cop(l.cost) + " / " + base(l.unit, l.cost_basis),
-                      <Button onClick={() => onAction("waste", l.id)}>
+                      <Button disabled={inventoryLocked} onClick={() => onAction("waste", l.id)}>
                         Registrar merma
                       </Button>,
                     ]
@@ -338,7 +357,7 @@ export function Inventory({
               "Documento / usuario",
               "Observación",
             ]}
-            rows={(history.stock_moves || []).map((m) => [
+            rows={filteredMoves.map((m) => [
               dt(m.created),
               <>
                 {m.name}
@@ -395,7 +414,7 @@ export function Inventory({
               <Badge tone={p.active ? "" : "red"}>{p.active ? "Activo" : "Desactivado"}</Badge>,
               ...(admin
                 ? [
-                    <Button onClick={() => onAction("edit_product", p.id)}>
+                    <Button disabled={inventoryLocked} onClick={() => onAction("edit_product", p.id)}>
                       {p.active ? "Editar / desactivar" : "Editar / reactivar"}
                     </Button>,
                   ]
@@ -407,7 +426,20 @@ export function Inventory({
     </>
   );
 }
-export function Customers({ state, history, business, admin, onAction }) {
+export function Customers({ state, history = {}, business, admin, onAction, start, end, onDates }) {
+  const [customerSearch, setCustomerSearch] = useState(""),
+    [debtStart, setDebtStart] = useState(""),
+    [debtEnd, setDebtEnd] = useState("");
+  const needle = normalize(customerSearch);
+  const filteredDebts = (history.debts || []).filter((debt) => {
+    const saleDate = colombiaDate(debt.created);
+    const matchesCustomer = !needle || normalize(`${debt.customer || ""} ${debt.document || ""} ${debt.phone || ""}`).includes(needle);
+    return matchesCustomer && (!debtStart || saleDate >= debtStart) && (!debtEnd || saleDate <= debtEnd);
+  });
+  const filteredCustomers = (state.customers || []).filter((customer) =>
+    !needle || normalize(`${customer.name || ""} ${customer.document || ""} ${customer.phone || ""} ${customer.email || ""}`).includes(needle),
+  );
+  const creditSales = history.credit_sales || [], creditTotal = creditSales.reduce((sum, sale) => sum + Number(sale.original_debt || 0), 0), creditCustomers = new Set(creditSales.map((sale) => sale.customer_id)).size;
   return (
     <>
       <Head
@@ -418,6 +450,11 @@ export function Customers({ state, history, business, admin, onAction }) {
           + Nuevo cliente
         </Button>
       </Head>
+      <div className="report-filter-bar">
+        <Field name="customer_debt_search" label="Buscar cliente" value={customerSearch} onChange={(event) => setCustomerSearch(event.target.value)} placeholder="Nombre, cédula, teléfono o correo" />
+        <Field name="customer_debt_start" label="Ventas desde" type="date" value={debtStart} onChange={(event) => setDebtStart(event.target.value)} />
+        <Field name="customer_debt_end" label="Ventas hasta" type="date" value={debtEnd} min={debtStart || undefined} onChange={(event) => setDebtEnd(event.target.value)} />
+      </div>
       <Metrics
         items={[
           {
@@ -439,15 +476,27 @@ export function Customers({ state, history, business, admin, onAction }) {
         ]}
       />
       <div className="stack">
+        <Panel title={start === end && start === localDate() ? "Fiados del día" : "Fiados del período consultado"}>
+          <div className="credit-day-head">
+            <DateRange start={start} end={end} onApply={onDates} />
+            <div><b>{cop(creditTotal)}</b><small>{creditSales.length} ventas · {creditCustomers} clientes</small></div>
+          </div>
+          <Table
+            headers={["Fecha", "Venta", "Cliente", "Valor fiado", "Abonado", "Saldo"]}
+            rows={creditSales.map((sale) => [dt(sale.created), saleNumber(sale, business), sale.customer, cop(sale.original_debt), cop(Math.max(0, sale.original_debt-sale.debt)), cop(sale.debt)])}
+          />
+          {!creditSales.length && <Notice info>No se registraron ventas fiadas en este período. Los abonos recibidos no se cuentan como nuevas ventas.</Notice>}
+        </Panel>
         <Panel title="Cuentas por cobrar">
           <Table
-            headers={["Cliente", "Venta", "Vence", "Saldo", "Acción"]}
-            rows={history.debts.map((d) => [
+            headers={["Cliente", "Venta", "Fecha de venta", "Vence", "Saldo", "Acción"]}
+            rows={filteredDebts.map((d) => [
               <>
                 {d.customer}
                 <small>{d.phone}</small>
               </>,
-              saleNumber(d, business),
+              d.offline ? `LOCAL-${String(d.request_id).slice(-6).toUpperCase()}` : saleNumber(d, business),
+              colombiaDate(d.created),
               <Badge tone={d.due < localDate() ? "red" : "warn"}>
                 {d.due}
               </Badge>,
@@ -467,7 +516,7 @@ export function Customers({ state, history, business, admin, onAction }) {
               "Saldo",
               "Acción",
             ]}
-            rows={state.customers.map((c) => [
+            rows={filteredCustomers.map((c) => [
               <>
                 {c.name}
                 <small>{c.document}</small>
@@ -479,7 +528,7 @@ export function Customers({ state, history, business, admin, onAction }) {
               c.credit_limit ? cop(c.credit_limit) : <Badge>Sin límite</Badge>,
               cop(c.balance),
               admin ? (
-                <div className="actions"><Button onClick={() => onAction("edit_customer", c.id)}>Editar</Button>{c.balance>0&&<Button primary onClick={()=>onAction("customer_payment",c.id)}>Pagar saldo</Button>}</div>
+                <div className="actions"><Button onClick={() => onAction("edit_customer", c.id)}>Editar</Button>{c.balance>0&&<Button primary onClick={()=>onAction("customer_payment",c.id)}>Pagar saldo</Button>}<Button onClick={()=>onAction("customer_statement",c.id)}>Imprimir estado de cuenta</Button></div>
               ) : (
                 "—"
               ),
@@ -543,6 +592,9 @@ export function Cash({ state, history, business, admin, onAction }) {
             <Button onClick={() => onAction("cash_move")}>
               Registrar entrada / retiro
             </Button>
+            {Number(c.nequi_total || 0) > 0 && <Button onClick={() => onAction("cash_nequi_adjustment")}>
+              Ajuste de efectivo y Nequi
+            </Button>}
             <Button primary onClick={() => onAction("close_cash")}>
               Cerrar y arquear caja
             </Button>
@@ -557,9 +609,14 @@ export function Cash({ state, history, business, admin, onAction }) {
         <Metrics
           items={[
             {
-              label: "Efectivo esperado",
-              value: cop(c.expected),
-              note: "Base + efectivo recibido + movimientos",
+              label: "Total ventas (efectivo + Nequi)",
+              value: cop(c.collected_sales_total || 0),
+              note: `Efectivo ${cop(c.cash_sales || 0)} · Nequi ${cop(c.nequi_sales || 0)} · Fiado aparte ${cop(c.credit_sales || 0)}`,
+            },
+            {
+              label: "Efectivo del turno (sin base)",
+              value: cop(c.expected_without_opening || 0),
+              note: "Entradas de efectivo menos salidas reales",
             },
             {
               label: "Base de apertura",
@@ -568,9 +625,9 @@ export function Cash({ state, history, business, admin, onAction }) {
             },
             { label: "Abierta por", value: c.operator, note: dt(c.opened) },
             {
-              label: "Sesión de caja",
-              value: "#" + c.id,
-              note: business === 1 ? "Mini market" : "Ferretería",
+              label: "Total a contar en caja",
+              value: cop(c.expected_total ?? c.expected),
+              note: `Nequi ${cop(c.nequi_total || 0)} · Fiado ${cop(c.credit_sales || 0)}`,
             },
           ]}
         />
@@ -619,11 +676,13 @@ export function Cash({ state, history, business, admin, onAction }) {
       {admin && (
         <Panel className="subsection" title="Entradas y retiros del período">
           <Table
-            headers={["Fecha", "Caja", "Motivo", "Valor"]}
+            headers={["Fecha", "Caja", "Tipo", "Motivo", "Usuario", "Valor"]}
             rows={(history.cash_moves || []).map((m) => [
               dt(m.created),
               "#" + m.cash_id,
+              m.kind || "Movimiento de caja",
               m.reason,
+              m.operator || "—",
               cop(m.amount),
             ])}
           />
@@ -684,13 +743,16 @@ export function Sales({
               </small>
             </>,
             s.customer || "Consumidor final",
-            cop(s.total),
+            cop(s.receipt_total ?? s.total),
             <>{s.payment_methods || (s.debt ? "Fiado" : "-")}{!!s.cash_received && <small>Recibido: {cop(s.cash_received)} / cambio: {cop(s.change_given)}</small>}</>,
             cop(s.debt),
             <Badge tone={s.offline ? "warn" : s.status === "void" ? "red" : ""}>
               {s.offline ? "LOCAL · pendiente" : s.status === "void" ? "Anulada" : "Registrada"}
             </Badge>,
             <div className="actions">
+              {s.offline && <Button onClick={() => onAction("print_offline_sale", s.request_id)}>
+                Reimprimir recibo local
+              </Button>}
               {!s.offline && <Button onClick={() => onAction("receipt_sale", s.id)}>
                 Ver recibo
               </Button>}

@@ -97,8 +97,10 @@ export default function PointOfSale({
   const customerResults = filterCustomers(state.customers, customerSearch);
   function add(id, index, scanned = false, product = null) {
     onProduct(id, index, () => {
-      setSearch("");
-      setHighlight(0);
+      if (scanned) {
+        setSearch("");
+        setHighlight(0);
+      }
       input.current?.focus();
     }, { scanned, product });
   }

@@ -18,11 +18,13 @@ class DairyTests(unittest.TestCase):
   with self.store.connect() as db:
    sale=dict(db.execute('SELECT total,dairy_total,cost FROM sales WHERE id=?',(result['id'],)).fetchone());stock=db.execute('SELECT SUM(qty) FROM lots WHERE product_id=?',(self.product,)).fetchone()[0];payment=db.execute('SELECT SUM(amount) FROM payments WHERE sale_id=?',(result['id'],)).fetchone()[0]
   self.assertEqual(sale,{'total':400000,'dairy_total':1050000,'cost':200000});self.assertEqual(stock,8);self.assertEqual(payment,400000)
+  history=self.store.history(self.user,1,today(),today())['sales'];self.assertEqual(len(history),1);self.assertEqual(history[0]['receipt_total'],1450000)
   state=dairy_state(self.store,self.user,today(),today());self.assertEqual(state['summary']['milk_qty'],1500);self.assertEqual(state['summary']['cheese_qty'],500);self.assertEqual(state['summary']['total'],1050000);self.assertIn('Efectivo: 14500.00',state['lines'][0]['payment_methods'])
   self.assertEqual(self.store.analytics(self.user,1,today(),today())['summary']['sales'],400000)
   with self.store.connect() as db:self.assertEqual(self.store.expected(db,self.store.cash(db,1)),400000)
  def test_prices_history_returns_close_and_reopen(self):
   sale=self.store.command(self.user,1,'sale',{'request_id':uuid.uuid4().hex,'lines':[],'dairy_lines':[{'product_id':1,'qty':1.25}],'payments':[{'method':'Nequi','amount':3750}]})['id']
+  history=self.store.history(self.user,1,today(),today())['sales'];self.assertEqual(len(history),1);self.assertEqual(history[0]['receipt_total'],375000)
   dairy_command(self.store,self.user,'price',{'product_id':1,'price':4000})
   state=dairy_state(self.store,self.user);line=state['lines'][0];self.assertEqual((line['qty'],line['price'],line['total']),(1250,300000,375000))
   dairy_command(self.store,self.user,'return',{'line_id':line['id'],'qty':.25,'reason':'Devolución','request_id':uuid.uuid4().hex})

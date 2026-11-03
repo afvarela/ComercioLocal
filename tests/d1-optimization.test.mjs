@@ -89,3 +89,21 @@ test("no existe polling periódico contra las rutas D1", () => {
   const source = [read("src/App.jsx"), read("src/lib/api.js")].join("\n");
   assert.doesNotMatch(source, /setInterval\s*\(/);
 });
+
+test("el resumen de caja agrupa las lecturas y usa un índice por caja", () => {
+  const store = read("cloudflare/store.mjs");
+  const migration = read("cloudflare/migrations/0020_cash_summary_index.sql");
+  assert.match(store, /cash_payment_net FROM payments WHERE cash_id=\?/);
+  assert.match(store, /moves_net FROM cash_moves WHERE cash_id=\?/);
+  assert.doesNotMatch(store, /const value=async\(sql\)/);
+  assert.match(migration, /CREATE INDEX IF NOT EXISTS idx_sales_cash_status ON sales\(cash_id,status\)/);
+  assert.doesNotMatch(migration, /\b(?:DROP|DELETE|UPDATE|INSERT)\b/i);
+});
+
+test("ventas y recibos incluye operaciones con lácteos sin sumarlas al reporte normal", () => {
+  const endpoint = read("cloudflare/read.mjs");
+  const page = read("src/pages/AdminPages.jsx");
+  assert.match(endpoint, /s\.total\+COALESCE\(s\.dairy_total,0\) receipt_total/);
+  assert.match(endpoint, /s\.total>0 OR COALESCE\(s\.dairy_total,0\)>0/);
+  assert.match(page, /receipt_total \?\? s\.total/);
+});

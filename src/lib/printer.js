@@ -39,6 +39,19 @@ export async function printReceipt(business, kind, id) {
     body: JSON.stringify({ printer, text: await r.text() }),
   });
 }
+export async function printAccountStatement(businessName, statement) {
+  const printer = selectedPrinter();
+  if (!printer) throw Error("No hay una impresora de recibos configurada en este equipo");
+  const width = 38, money = (value) => cop(Number(value || 0)), wrap = (value) => {
+    const words=String(value||"").split(/\s+/),result=[];let line="";
+    for(const word of words){const next=line?`${line} ${word}`:word;if(next.length>width&&line){result.push(line);line=word}else line=next}if(line)result.push(line);return result;
+  }, row=(label,value)=>{const right=String(value),left=String(label).slice(0,Math.max(1,width-right.length-1));return left.padEnd(width-right.length)+right;};
+  const lines=[...wrap(businessName.toUpperCase()).map(x=>x.padStart(Math.floor((width+x.length)/2))),"ESTADO DE CUENTA",statement.customer.name,`CC/NIT: ${statement.customer.document||"Sin documento"}`,"-".repeat(width)];
+  let currentDate="";
+  for(const sale of statement.sales||[]){const day=String(sale.created||"").slice(0,10);if(day!==currentDate){if(currentDate)lines.push("-".repeat(width));lines.push(`FECHA ${day}`);currentDate=day;}const saleCode=Number.isFinite(Number(sale.number))?String(sale.number).padStart(6,"0"):String(sale.number||"LOCAL");lines.push(`Factura #${saleCode}`);for(const item of sale.lines||[]){lines.push(...wrap(item.name));const quantityText=qty(item.qty,item.unit),basis=item.unit==="g"?(Number(item.price_basis)===500?"/libra":"/kg"):`/${item.unit}`;lines.push(row(`${quantityText} ${item.unit} x ${money(item.price)}${basis}`,money(item.total)));}lines.push(row("Fiado de la compra",money(sale.original_debt)),row("Saldo de la compra",money(sale.debt)));}
+  lines.push("=".repeat(width),row("TOTAL FIADO",money(statement.total_credit)),row("(-) ABONOS",money(statement.payments)),...(statement.returns?[row("(-) DEVOLUCIONES",money(statement.returns))]:[]),row("SALDO PENDIENTE",money(statement.balance)),"",...wrap("Estado de cuenta interno. Conserve este comprobante."),"","","");
+  return call("/print", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ printer, text: lines.join("\n") }) });
+}
 export async function printDispatch(business, id) {
   const printer = selectedDispatchPrinter();
   if (!printer) throw Error("No hay una impresora de despachos configurada en este equipo");

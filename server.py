@@ -154,9 +154,14 @@ class Store:
                 ('label_settings','row_gap_mm','INTEGER NOT NULL DEFAULT 0'),
                 ('label_settings','page_margin_mm','INTEGER NOT NULL DEFAULT 0'),
                 ('label_settings','barcode_gap_mm','INTEGER NOT NULL DEFAULT 2'),
+                ('customers','request_id','TEXT'),
+                ('cash_moves','kind',"TEXT NOT NULL DEFAULT 'Movimiento de caja'"),
+                ('cash_moves','request_id','TEXT'),
             ]:
                 if column not in [r['name'] for r in db.execute(f'PRAGMA table_info({table})')]:
                     db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_offline_request ON customers(business_id,request_id) WHERE request_id IS NOT NULL')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_moves_request ON cash_moves(request_id) WHERE request_id IS NOT NULL')
             for column,definition,source in [('can_create','INTEGER NOT NULL DEFAULT 0','can_write'),('can_export','INTEGER NOT NULL DEFAULT 0','can_report')]:
                 if column not in [r['name'] for r in db.execute('PRAGMA table_info(finance_permissions)')]:
                     db.execute(f'ALTER TABLE finance_permissions ADD COLUMN {column} {definition}')
@@ -199,7 +204,42 @@ class Store:
     def cash(self,db,b):
         c=self.one(db,'SELECT * FROM cash_sessions WHERE business_id=? AND closed IS NULL',(b,)); require(c,'Abra la caja de este negocio antes de continuar'); return c
     def expected(self,db,c):
-        return c['opening']+db.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE cash_id=? AND method='Efectivo'",(c['id'],)).fetchone()[0]+db.execute('SELECT COALESCE(SUM(amount),0) FROM cash_moves WHERE cash_id=?',(c['id'],)).fetchone()[0]
+        regular=db.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE cash_id=? AND method='Efectivo'",(c['id'],)).fetchone()[0]
+        moves=db.execute('SELECT COALESCE(SUM(amount),0) FROM cash_moves WHERE cash_id=?',(c['id'],)).fetchone()[0]
+        return c['opening']+regular+moves
+    def cash_summary(self,db,c):
+        cash_id=c['id']
+        sales=self.one(db,"""SELECT COALESCE(SUM(total),0) sales_total,
+          COALESCE(SUM(original_debt),0) credit_sales
+          FROM sales WHERE cash_id=? AND status='active'""",(cash_id,))
+        payments=self.one(db,"""SELECT
+          COALESCE(SUM(CASE WHEN method='Efectivo' AND kind='Venta' THEN amount ELSE 0 END),0) cash_sales,
+          COALESCE(SUM(CASE WHEN method='Nequi' AND kind='Venta' THEN amount ELSE 0 END),0) nequi_sales,
+          COALESCE(SUM(CASE WHEN method='Nequi' THEN amount ELSE 0 END),0) nequi_total,
+          COALESCE(SUM(CASE WHEN method='Efectivo' AND kind='Abono' THEN amount ELSE 0 END),0) cash_collections,
+          COALESCE(SUM(CASE WHEN method='Nequi' AND kind='Abono' THEN amount ELSE 0 END),0) nequi_collections,
+          COALESCE(SUM(CASE WHEN method='Efectivo' AND amount<0 THEN -amount ELSE 0 END),0) cash_refunds,
+          COALESCE(SUM(CASE WHEN method='Efectivo' THEN amount ELSE 0 END),0) cash_payment_net
+          FROM payments WHERE cash_id=?""",(cash_id,))
+        moves=self.one(db,"""SELECT
+          COALESCE(SUM(CASE WHEN kind='Ajuste efectivo y Nequi' AND amount<0 THEN -amount ELSE 0 END),0) adjustments_total,
+          COALESCE(SUM(amount),0) moves_net
+          FROM cash_moves WHERE cash_id=?""",(cash_id,))
+        last=self.one(db,'SELECT nequi_amount,decision,created FROM cash_nequi_reviews WHERE cash_id=? ORDER BY id DESC LIMIT 1',(cash_id,)) or {}
+        expected_without_opening=payments['cash_payment_net']+moves['moves_net']; expected_total=c['opening']+expected_without_opening
+        return {'sales_total':sales['sales_total'],'collected_sales_total':payments['cash_sales']+payments['nequi_sales'],'cash_sales':payments['cash_sales'],'nequi_sales':payments['nequi_sales'],'nequi_total':payments['nequi_total'],'credit_sales':sales['credit_sales'],'cash_collections':payments['cash_collections'],'nequi_collections':payments['nequi_collections'],'cash_refunds':payments['cash_refunds'],'adjustments_total':moves['adjustments_total'],'cash_moves_net':moves['moves_net'],'expected_total':expected_total,'expected_without_opening':expected_without_opening,'reviewed_nequi_amount':last.get('nequi_amount',0),'nequi_review_required':bool(payments['nequi_total']>last.get('nequi_amount',0))}
+    def ensure_receivables(self,db,b,customer_id=None,sale_id=None):
+        filters=['s.business_id=?','s.customer_id IS NOT NULL','s.original_debt>0']; args=[b]
+        if customer_id is not None: filters.append('s.customer_id=?'); args.append(customer_id)
+        if sale_id is not None: filters.append('s.id=?'); args.append(sale_id)
+        db.execute(f"""INSERT OR IGNORE INTO receivables(business_id,customer_id,sale_id,created,original_amount,paid_amount,returned_amount,balance,status)
+          SELECT s.business_id,s.customer_id,s.id,s.created,s.original_debt,MAX(0,s.original_debt-s.debt),0,s.debt,
+          CASE WHEN s.status='void' THEN 'Anulado' WHEN s.debt=0 THEN 'Pagado' WHEN s.debt<s.original_debt THEN 'Parcialmente pagado' ELSE 'Pendiente' END
+          FROM sales s WHERE {' AND '.join(filters)}""",args)
+        db.execute("""INSERT OR IGNORE INTO receivable_moves(receivable_id,business_id,customer_id,sale_id,created,kind,amount,balance_after,user_id,note,request_id)
+          SELECT r.id,r.business_id,r.customer_id,r.sale_id,r.created,'Saldo reparado',r.original_amount,r.balance,s.user_id,'Cuenta por cobrar recuperada automáticamente','reparacion-'||r.sale_id
+          FROM receivables r JOIN sales s ON s.id=r.sale_id
+          WHERE r.business_id=? AND NOT EXISTS(SELECT 1 FROM receivable_moves m WHERE m.receivable_id=r.id)""",(b,))
     def update_average(self,db,p):
         lots=self.rows(db,'SELECT qty,cost,cost_basis FROM lots WHERE product_id=? AND qty>0',(p['id'],)); total_qty=sum(x['qty'] for x in lots)
         if not total_qty: average=0
@@ -265,7 +305,7 @@ class Store:
             if u['role']!='admin':
                 for l in lots: l.pop('cost',None)
             c=self.one(db,'SELECT c.*,u.name operator FROM cash_sessions c JOIN users u ON u.id=c.user_id WHERE c.business_id=? AND c.closed IS NULL',(b,))
-            if c: c['expected']=self.expected(db,c)
+            if c: c.update(self.cash_summary(db,c),expected=self.expected(db,c))
             customers=self.rows(db,"SELECT c.*,COALESCE(s.balance,0) balance,COALESCE(s.total_purchases,0) total_purchases,COALESCE(s.purchase_count,0) purchase_count FROM customers c LEFT JOIN (SELECT customer_id,SUM(debt) balance,SUM(total) total_purchases,COUNT(*) purchase_count FROM sales WHERE business_id=? AND status='active' GROUP BY customer_id) s ON s.customer_id=c.id WHERE c.business_id=? ORDER BY c.name",(b,b)) if include_customers else []
             return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'inactive_products':inactive_products,'lots':lots,'customers':customers,'cash':c,'unregistered_options':self.rows(db,'SELECT * FROM unregistered_options WHERE business_id=? AND (active=1 OR ?=1) ORDER BY active DESC,name',(b,int(u['role']=='admin'))),'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
     def lines(self,db,b,raw,stock=True):
@@ -362,7 +402,11 @@ class Store:
                 vals=(clean(d['name']),clean(d.get('document')),clean(d.get('phone')),email,credit_limit)
                 if d.get('id'):
                     self.admin(u); self.scoped(db,'customers',d['id'],b); db.execute('UPDATE customers SET name=?,document=?,phone=?,email=?,credit_limit=? WHERE id=? AND business_id=?',(*vals,d['id'],b))
-                else: result['id']=db.execute('INSERT INTO customers(business_id,name,document,phone,email,credit_limit) VALUES(?,?,?,?,?,?)',(b,*vals)).lastrowid
+                else:
+                    request_id=clean(d.get('request_id')) or None
+                    existing=self.one(db,'SELECT id FROM customers WHERE business_id=? AND request_id=?',(b,request_id)) if request_id else None
+                    if existing: return {'ok':True,'id':existing['id']}
+                    result['id']=db.execute('INSERT INTO customers(business_id,name,document,phone,email,credit_limit,request_id) VALUES(?,?,?,?,?,?,?)',(b,*vals,request_id)).lastrowid
             elif action=='unregistered_option':
                 name=clean(d.get('name')).upper(); require(name,'Escriba el nombre de la opción')
                 if d.get('id'):
@@ -377,16 +421,31 @@ class Store:
                 c=self.cash(db,b); value=money(d['amount']); require(value>0 and clean(d.get('reason')),'Indique valor y motivo')
                 require(d.get('direction') in ('in','out'),'Tipo de movimiento inválido')
                 value*= -1 if d['direction']=='out' else 1; require(self.expected(db,c)+value>=0,'El retiro supera el efectivo esperado')
-                result['id']=db.execute('INSERT INTO cash_moves(business_id,cash_id,user_id,created,amount,reason) VALUES(?,?,?,?,?,?)',(b,c['id'],u['id'],now(),value,clean(d['reason']))).lastrowid
+                result['id']=db.execute('INSERT INTO cash_moves(business_id,cash_id,user_id,created,amount,reason,kind) VALUES(?,?,?,?,?,?,?)',(b,c['id'],u['id'],now(),value,clean(d['reason']),'Movimiento de caja')).lastrowid
+            elif action=='cash_nequi_review':
+                c=self.cash(db,b); request=clean(d.get('request_id')) or secrets.token_urlsafe(18)
+                existing=self.one(db,'SELECT id FROM cash_nequi_reviews WHERE request_id=?',(request,))
+                if existing: return {'ok':True,'id':existing['id']}
+                summary=self.cash_summary(db,c); decision=clean(d.get('decision')); require(decision in ('adjust','continue'),'Confirme si registra una salida o continúa sin ajuste')
+                adjustment=money(d.get('amount') or 0); reason=clean(d.get('reason'),1000)
+                if decision=='adjust':
+                    require(adjustment>0 and reason,'Indique el valor retirado y el motivo real de la salida')
+                    require(self.expected(db,c)-adjustment>=0,'La salida supera el efectivo esperado en caja')
+                    db.execute('INSERT INTO cash_moves(business_id,cash_id,user_id,created,amount,reason,kind,request_id) VALUES(?,?,?,?,?,?,?,?)',(b,c['id'],u['id'],now(),-adjustment,reason,'Ajuste efectivo y Nequi',request+':move'))
+                else:
+                    require(adjustment==0,'No indique un valor si continúa sin ajuste')
+                result['id']=db.execute('INSERT INTO cash_nequi_reviews(business_id,cash_id,user_id,created,nequi_amount,decision,adjustment_amount,reason,request_id) VALUES(?,?,?,?,?,?,?,?,?)',(b,c['id'],u['id'],now(),summary['nequi_total'],'Ajuste registrado' if decision=='adjust' else 'Continuar sin ajuste',adjustment,reason,request)).lastrowid
             elif action=='close_cash':
                 c=self.cash(db,b); require(u['role']=='admin' or c['user_id']==u['id'],'Solo quien abrió la caja o el administrador puede cerrarla')
+                require(not self.cash_summary(db,c)['nequi_review_required'],'Revise primero si necesita registrar una salida de efectivo relacionada con Nequi')
                 counted=money(d['counted']); expected=self.expected(db,c); difference=counted-expected
                 reason=clean(d.get('difference_reason')); note=clean(d.get('difference_note'),1000)
                 if difference:
                     require(reason in ('Error de conteo','Gasto no registrado','Ingreso no registrado','Dinero entregado o retirado','Otro'),'Seleccione el motivo de la diferencia')
                     require(reason!='Otro' or note,'Describa el motivo cuando selecciona Otro')
                 dtype='Sobrante' if difference>0 else 'Faltante' if difference<0 else 'Exacta'
-                db.execute('UPDATE cash_sessions SET closed=?,counted=?,expected=?,difference=?,difference_type=?,difference_reason=?,difference_note=?,closed_by=?,note=note || ? WHERE id=?',(now(),counted,expected,difference,dtype,reason,note,u['id'],'\nCierre: '+clean(d.get('note'),1000),c['id']))
+                closing_note=clean(d.get('note'),1000); note_suffix=('\nCierre: '+closing_note) if closing_note else ''
+                db.execute('UPDATE cash_sessions SET closed=?,counted=?,expected=?,difference=?,difference_type=?,difference_reason=?,difference_note=?,closed_by=?,note=note || ? WHERE id=?',(now(),counted,expected,difference,dtype,reason,note,u['id'],note_suffix,c['id']))
                 result.update(id=c['id'],receipt='cash',difference=difference,difference_type=dtype)
             elif action=='customer_payment':
                 c=self.cash(db,b); cid=int(d.get('customer_id') or 0); self.scoped(db,'customers',cid,b)
@@ -395,6 +454,7 @@ class Store:
                 if existing: return {'ok':True,'id':existing['id'],'receipt':'collection'}
                 method=d.get('method'); require(method in METHODS,'Medio de pago inválido')
                 value=money(d.get('amount')); require(value>0,'Ingrese un valor mayor que cero')
+                self.ensure_receivables(db,b,customer_id=cid)
                 pending=self.rows(db,"SELECT * FROM receivables WHERE business_id=? AND customer_id=? AND balance>0 AND status!='Anulado' ORDER BY created,id",(b,cid))
                 require(pending,'El cliente no tiene cuentas pendientes')
                 requested=d.get('allocations') or []
@@ -494,9 +554,10 @@ class Store:
                 existing=self.one(db,'SELECT payment_id FROM receivable_moves WHERE request_id=?',(request,))
                 if existing: return {'ok':True,'id':existing['payment_id'],'receipt':'payment'}
                 require(sale['status']=='active' and 0<val<=sale['debt'],'El abono debe ser positivo y no superar el saldo'); require(method in METHODS,'Medio inválido')
+                self.ensure_receivables(db,b,sale_id=sale['id'])
+                receivable=self.one(db,'SELECT * FROM receivables WHERE sale_id=?',(sale['id'],)); require(receivable,'No fue posible recuperar la cuenta por cobrar')
                 result['id']=db.execute('INSERT INTO payments(business_id,sale_id,cash_id,user_id,created,method,amount,kind,reference) VALUES(?,?,?,?,?,?,?,?,?)',(b,sale['id'],c['id'],u['id'],now(),method,val,'Abono',clean(d.get('reference')))).lastrowid
                 db.execute('UPDATE sales SET debt=debt-? WHERE id=?',(val,sale['id']))
-                receivable=self.one(db,'SELECT * FROM receivables WHERE sale_id=?',(sale['id'],)); require(receivable,'La cuenta por cobrar no existe; contacte al administrador')
                 balance=receivable['balance']-val
                 status='Pagado' if balance==0 else 'Parcialmente pagado'
                 db.execute('UPDATE receivables SET paid_amount=paid_amount+?,balance=?,status=? WHERE id=?',(val,balance,status,receivable['id']))
@@ -596,21 +657,39 @@ class Store:
             detail={k:v for k,v in d.items() if k not in ('password','current')}
             self.audit(db,u,b,action,detail)
             return result
+    def customer_statement(self,u,b,customer_id):
+        with self.connect() as db:
+            customer=self.scoped(db,'customers',customer_id,b)
+            self.ensure_receivables(db,b,customer_id=customer_id)
+            sales=self.rows(db,"""SELECT s.id,s.number,s.created,s.total,s.original_debt,s.debt,s.due,
+              COALESCE(r.paid_amount,MAX(0,s.original_debt-s.debt)) paid_amount,COALESCE(r.returned_amount,0) returned_amount
+              FROM sales s LEFT JOIN receivables r ON r.sale_id=s.id
+              WHERE s.business_id=? AND s.customer_id=? AND s.original_debt>0 AND s.status='active'
+              ORDER BY s.created,s.id""",(b,customer_id))
+            if not sales: return {'customer':customer,'sales':[],'total_credit':0,'payments':0,'returns':0,'balance':0}
+            ids=[x['id'] for x in sales]; marks=','.join('?' for _ in ids)
+            lines=self.rows(db,f'SELECT sale_id,name,unit,qty,price,total,price_basis FROM sale_lines WHERE sale_id IN ({marks}) ORDER BY id',ids)
+            lines+=self.rows(db,f"SELECT sale_id,description name,unit,qty,price,total,1 price_basis FROM unregistered_sale_lines WHERE sale_id IN ({marks}) ORDER BY id",ids)
+            lines+=self.rows(db,f"SELECT l.sale_id,p.name,p.unit,l.qty,l.price,l.total,1000 price_basis FROM dairy_sale_lines l JOIN dairy_products p ON p.id=l.product_id WHERE l.sale_id IN ({marks}) AND l.status='active' ORDER BY l.id",ids)
+            grouped={x['id']:[] for x in sales}
+            for line in lines: grouped[line['sale_id']].append(line)
+            for sale in sales: sale['lines']=grouped[sale['id']]
+            return {'customer':customer,'sales':sales,'total_credit':sum(x['original_debt'] for x in sales),'payments':sum(x['paid_amount'] for x in sales),'returns':sum(x['returned_amount'] for x in sales),'balance':sum(x['debt'] for x in sales)}
     def history(self,u,b,start,end):
         start=iso(start); end=iso(end); require(start<=end,'Rango de fechas inválido')
         with self.connect() as db:
-            sales=self.rows(db,"SELECT s.*,c.name customer,c.phone customer_phone,c.document customer_document,c.email customer_email,u.name operator,COALESCE((SELECT GROUP_CONCAT(method||': '||printf('%.2f',amount/100.0),' · ') FROM (SELECT method,SUM(amount) amount FROM (SELECT method,amount FROM payments WHERE sale_id=s.id AND amount>0 UNION ALL SELECT method,amount FROM dairy_payments WHERE sale_id=s.id AND amount>0) GROUP BY method)),'Fiado') payment_methods FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND s.total>0 AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY s.id DESC",(b,start,end))
-            debts=self.rows(db,"SELECT s.*,c.name customer,c.phone FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.debt>0 AND s.status='active' ORDER BY s.due,s.id",(b,))
+            sales=self.rows(db,"SELECT s.*,s.total+COALESCE(s.dairy_total,0) receipt_total,c.name customer,c.phone customer_phone,c.document customer_document,c.email customer_email,u.name operator,COALESCE((SELECT GROUP_CONCAT(method||': '||printf('%.2f',amount/100.0),' · ') FROM (SELECT method,SUM(amount) amount FROM (SELECT method,amount FROM payments WHERE sale_id=s.id AND amount>0 UNION ALL SELECT method,amount FROM dairy_payments WHERE sale_id=s.id AND amount>0) GROUP BY method)),'Fiado') payment_methods FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND (s.total>0 OR COALESCE(s.dairy_total,0)>0) AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY s.id DESC",(b,start,end))
+            debts=self.rows(db,"SELECT s.*,c.name customer,c.phone,c.document FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.debt>0 AND s.status='active' ORDER BY s.due,s.id",(b,))
             if u['role']!='admin':
                 for s in sales+debts: s.pop('cost',None)
-            result={'sales':sales,'debts':debts,'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,'SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY l.id DESC',(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
+            result={'sales':sales,'debts':debts,'credit_sales':self.rows(db,"SELECT s.id,s.number,s.created,s.customer_id,c.name customer,s.original_debt,s.debt,s.status FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.original_debt>0 AND s.status='active' AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY s.created DESC,s.id DESC",(b,start,end)),'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,'SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY l.id DESC',(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
             if u['role']=='admin':
                 result['stock_moves']=self.rows(db,'SELECT m.*,p.name,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? ORDER BY m.id DESC',(b,start,end))
                 result['payments']=self.rows(db,'SELECT method,kind,SUM(amount) amount FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ? GROUP BY method,kind',(b,start,end))
                 result['sale_payments']=self.rows(db,'SELECT sale_id,method,amount,kind FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ?',(b,start,end))
                 result['top']=self.rows(db,"SELECT l.product_id,l.name,l.unit,SUM(l.qty) qty,SUM(l.total) total,SUM(l.total-l.cost) margin FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' AND substr(s.created,1,10) BETWEEN ? AND ? GROUP BY l.product_id,l.name,l.unit ORDER BY total DESC",(b,start,end))
                 result['audit']=self.rows(db,'SELECT a.created,a.action,u.name operator,a.detail FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.business_id=? AND substr(a.created,1,10) BETWEEN ? AND ? ORDER BY a.id DESC LIMIT 500',(b,start,end))
-                result['cash_moves']=self.rows(db,'SELECT * FROM cash_moves WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ? ORDER BY id DESC',(b,start,end))
+                result['cash_moves']=self.rows(db,'SELECT m.*,u.name operator FROM cash_moves m JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? ORDER BY m.id DESC',(b,start,end))
                 result['users']=self.rows(db,'SELECT id,username,name,role,businesses,active FROM users')
                 result['finance_permissions']=self.rows(db,'SELECT * FROM finance_permissions ORDER BY user_id,business_id')
                 result['dairy_permissions']=self.rows(db,'SELECT * FROM dairy_permissions ORDER BY user_id')
@@ -682,7 +761,8 @@ class Store:
         elif kind=='quote':
             data=self.scoped(db,'quotes',id,b); data['lines']=json.loads(data['lines']); data['title']='Cotización'; data['code']=f'COT-{id:06d}'
         elif kind in ('cash','cash_open'):
-            data=self.scoped(db,'cash_sessions',id,b); data['title']='Cierre de caja' if data['closed'] else 'Apertura de caja'; data['code']=f'CAJA-{id:06d}'; data['created']=data['opened']; data['payments']=self.rows(db,'SELECT method,SUM(amount) amount FROM payments WHERE cash_id=? GROUP BY method',(id,)); data['moves']=self.rows(db,'SELECT * FROM cash_moves WHERE cash_id=?',(id,)); data['expected']=data['expected'] if data['closed'] else self.expected(db,data)
+            data=self.scoped(db,'cash_sessions',id,b); data['title']='Cierre de caja' if data['closed'] else 'Apertura de caja'; data['code']=f'CAJA-{id:06d}'; data['created']=data['opened']; data['payments']=self.rows(db,'SELECT method,SUM(amount) amount FROM payments WHERE cash_id=? GROUP BY method',(id,)); data['moves']=self.rows(db,'SELECT m.*,u.name operator FROM cash_moves m JOIN users u ON u.id=m.user_id WHERE m.cash_id=? ORDER BY m.id',(id,)); data.update(self.cash_summary(db,data)); data['expected']=data['expected'] if data['closed'] else data['expected_total']
+            opening_note,separator,closing_note=(data.get('note') or '').partition('\nCierre: '); data['note']=opening_note.strip(); data['closing_note']=closing_note.strip() if separator else ''
             if kind=='cash_open':
                 data.update(title='Apertura de caja',closed=None,counted=None,expected=data['opening'],payments=[],moves=[],note=data['note'].split('\nCierre: ')[0])
         elif kind=='payment':
@@ -709,7 +789,8 @@ class Store:
             q=l['qty']/1000 if l['unit'] in ('m','litro','libra') else l['qty']; base=('libra (500 g)' if l.get('price_basis',1000)==500 else 'kg') if l['unit']=='g' else l['unit']
             rows.append(f"<p><b>{e(l['name'])}</b><br>{q:g} {e(l['unit'])} × {fmt(l['price'])}/{base}<strong>{fmt(l['total'])}</strong></p>")
         if 'total' in d: rows.append('<hr><h2>Total '+fmt(d['total'])+'</h2><p>Precios finales registrados en el sistema.</p>')
-        for p in d.get('payments',[]): rows.append('<p>'+e(p.get('kind',''))+' '+e(p['method'])+'<strong>'+fmt(p['amount'])+'</strong></p>')
+        if kind not in ('cash','cash_open'):
+            for p in d.get('payments',[]): rows.append('<p>'+e(p.get('kind',''))+' '+e(p['method'])+'<strong>'+fmt(p['amount'])+'</strong></p>')
         if kind=='collection':
             rows.append('<hr><h2>Abono '+fmt(d['amount'])+'</h2><p>Medio de pago<strong>'+e(d['method'])+'</strong></p>')
             for a in d['allocations']: rows.append('<p>Factura #'+str(a['number'])+'<strong>'+fmt(a['amount'])+'</strong><br>Saldo: '+fmt(a['balance_after'])+'</p>')
@@ -722,13 +803,26 @@ class Store:
             if d['status']=='void': rows.append('<h2>ANULADO</h2><p>'+e(d['void_reason'])+'</p>')
         if kind=='quote': rows.append('<p>Válida hasta '+e(d['valid_until'])+'</p><p>'+e(d['note'])+'</p><p>No reserva inventario. Conversión a precios vigentes.</p>')
         if kind in ('cash','cash_open'):
-            rows.append('<hr><p>Base inicial<strong>'+fmt(d['opening'])+'</strong></p>')
-            for m in d['moves']: rows.append('<p>'+e(m['reason'])+'<strong>'+fmt(m['amount'])+'</strong></p>')
-            rows.append('<p>Efectivo esperado<strong>'+fmt(d['expected'])+'</strong></p>')
-            if d['closed']: rows.append('<p>Contado<strong>'+fmt(d['counted'])+'</strong></p><p>Diferencia<strong>'+fmt(d['counted']-d['expected'])+'</strong></p><p>Cerrada: '+e(d['closed'])+'</p>')
-            rows.append('<p>'+e(d['note'])+'</p>')
+            signed=lambda value: ('+ ' if value>=0 else '- ')+fmt(abs(value))
+            cash_row=lambda label,value,classes='': '<p class="cash-row '+classes+'"><span>'+e(label)+'</span><strong>'+value+'</strong></p>'
+            rows.append('<hr>'+cash_row('RESUMEN DE VENTAS','','cash-heading'))
+            rows.append(cash_row('TOTAL VENTAS',fmt(d['collected_sales_total']),'cash-total'))
+            rows.append(cash_row('Ventas en efectivo',fmt(d['cash_sales']))+cash_row('Ventas por Nequi',fmt(d['nequi_sales']))+cash_row('Ventas fiadas',fmt(d['credit_sales'])))
+            if d['cash_collections'] or d['nequi_collections']:
+                rows.append(cash_row('ABONOS RECIBIDOS','','cash-heading'))
+                rows.append(cash_row('Abonos en efectivo',fmt(d['cash_collections']))+cash_row('Abonos por Nequi',fmt(d['nequi_collections'])))
+            rows.append(cash_row('CUADRE DE EFECTIVO','','cash-heading'))
+            rows.append(cash_row('Base de apertura','+ '+fmt(d['opening']))+cash_row('Efectivo de ventas','+ '+fmt(d['cash_sales']))+cash_row('Abonos en efectivo','+ '+fmt(d['cash_collections']))+cash_row('Devoluciones en efectivo','- '+fmt(d['cash_refunds'])))
+            for m in d['moves']:
+                move_label='Salida / traslado de efectivo' if m.get('kind')=='Ajuste efectivo y Nequi' else ('Entrada de efectivo' if m['amount']>=0 else 'Salida de efectivo')
+                rows.append('<p class="cash-row"><span>'+e(move_label)+'<small>'+e(m['reason'])+'<br>'+e(m['created'])+' · '+e(m['operator'])+'</small></span><strong>'+signed(m['amount'])+'</strong></p>')
+            rows.append(cash_row('EFECTIVO ESPERADO (SIN BASE)',signed(d['expected_without_opening']),'cash-total')+cash_row('Base de apertura','+ '+fmt(d['opening']))+cash_row('TOTAL A CONTAR EN CAJA',fmt(d['expected_total']),'cash-total'))
+            if d['closed']:
+                rows.append(cash_row('Efectivo contado',fmt(d['counted']))+cash_row('DIFERENCIA',signed(d['counted']-d['expected_total']),'cash-total')+'<p>Cierre: '+e(d['closed'])+'</p>')
+                if d.get('closing_note'): rows.append('<p>Nota del cierre: '+e(d['closing_note'])+'</p>')
+            if d.get('note'): rows.append('<p>Nota de apertura: '+e(d['note'])+'</p>')
         if kind=='payment': rows.append('<p>'+e(d['method'])+'<strong>'+fmt(d['amount'])+'</strong></p><p>Venta interna #'+e(d['sale_id'])+'</p><p>Saldo actual<strong>'+fmt(d['balance'])+'</strong></p>')
-        return f'''<!doctype html><html lang="es"><meta charset="utf-8"><title>{e(d['code'])}</title><style>body{{font:13px monospace;width:{business['receipt_width']-8}mm;margin:12px auto;color:#111}}h1{{font-size:20px}}h2{{font-size:16px}}header,footer{{text-align:center}}p{{overflow-wrap:anywhere}}strong{{float:right;margin-left:6px}}hr{{border:0;border-top:1px dashed}}button{{padding:10px;margin:8px}}@page{{size:{business['receipt_width']}mm auto;margin:4mm}}@media print{{.toolbar{{display:none}}body{{margin:0}}}}</style><div class="toolbar"><button onclick="window.print()">Imprimir / guardar PDF</button></div><header><h1>{e(business['name'])}</h1><p>{e(business['nit'])}<br>{e(business['address'])}<br>{e(business['phone'])}</p><h2>{e(d['title'])}</h2><b>{e(d['code'])}</b></header><p>{e(d['created'])}<br>Atendió: {e(d['operator'])}</p><hr>{''.join(rows)}<hr><footer><p>Comprobante interno.<br>No es factura electrónica ni documento equivalente electrónico validado por la DIAN.</p><p>Gracias por su compra</p></footer><script>if(new URLSearchParams(location.search).has('print'))window.addEventListener('load',()=>window.print())</script></html>'''
+        return f'''<!doctype html><html lang="es"><meta charset="utf-8"><title>{e(d['code'])}</title><style>body{{font:13px monospace;width:{business['receipt_width']-8}mm;margin:12px auto;color:#111}}h1{{font-size:20px}}h2{{font-size:16px}}header,footer{{text-align:center}}p{{overflow-wrap:anywhere}}strong{{float:right;margin-left:6px}}hr{{border:0;border-top:1px dashed}}button{{padding:10px;margin:8px}}.cash-row{{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:6px;margin:6px 0}}.cash-row span{{min-width:0;overflow-wrap:anywhere}}.cash-row strong{{float:none;margin:0;text-align:right;white-space:nowrap}}.cash-row small{{display:block;font-size:10px;line-height:1.3;margin-top:2px}}.cash-heading{{font-weight:bold;border-bottom:1px dashed;padding:8px 0 3px;margin-top:10px}}.cash-total{{font-weight:bold}}.cash-note{{font-size:10px;line-height:1.35;margin:7px 0}}@page{{size:{business['receipt_width']}mm auto;margin:4mm}}@media print{{.toolbar{{display:none}}body{{margin:0}}}}</style><div class="toolbar"><button onclick="window.print()">Imprimir / guardar PDF</button></div><header><h1>{e(business['name'])}</h1><p>{e(business['nit'])}<br>{e(business['address'])}<br>{e(business['phone'])}</p><h2>{e(d['title'])}</h2><b>{e(d['code'])}</b></header><p>{e(d['created'])}<br>Atendió: {e(d['operator'])}</p><hr>{''.join(rows)}<hr><footer><p>Comprobante interno.<br>No es factura electrónica ni documento equivalente electrónico validado por la DIAN.</p><p>Gracias por su compra</p></footer><script>if(new URLSearchParams(location.search).has('print'))window.addEventListener('load',()=>window.print())</script></html>'''
     def quote_pdf(self,b,id):
         with self.connect() as db: business,d=self.receipt_data(db,b,'quote',id)
         if not SimpleDocTemplate:
@@ -763,12 +857,25 @@ class Store:
         if d.get('customer'): out += [f"Cliente: {d['customer']['name']}",f"Documento: {d['customer']['document']}"]
         if d.get('lines'): out += pos_product_receipt_lines(d['lines'],width)
         if 'total' in d: out += ['-'*width,row('TOTAL',fmt(d['total']))]
-        for p in d.get('payments',[]): out.append(row(f"{p.get('kind','')} {p['method']}",fmt(p['amount'])))
+        if kind not in ('cash','cash_open'):
+            for p in d.get('payments',[]): out.append(row(f"{p.get('kind','')} {p['method']}",fmt(p['amount'])))
         if kind=='collection': out += [row('Abono',fmt(d['amount'])),*wrap(f"Medio: {d['method']}"),row('Saldo cliente',fmt(d['balance']))]
         if kind=='sale':
             if d.get('cash_received'): out += [row('Efectivo recibido',fmt(d['cash_received'])),row('Cambio entregado',fmt(d['change_given']))]
             out += [row('Saldo fiado',fmt(d['debt']))]
-        if kind in ('cash','cash_open'): out += [row('Base',fmt(d['opening'])),row('Efectivo esperado',fmt(d['expected']))]
+        if kind in ('cash','cash_open'):
+            cash_fmt=lambda value:f'$ {value/100:,.0f}'
+            signed=lambda value:('+ ' if value>=0 else '- ')+cash_fmt(abs(value))
+            cash_lines=lambda label,value: [row(line,value if index==len(textwrap.wrap(str(label),label_width) or [''])-1 else '') for index,line in enumerate(textwrap.wrap(str(label),label_width) or [''])]
+            out += ['RESUMEN DE VENTAS',*cash_lines('TOTAL VENTAS',cash_fmt(d['collected_sales_total'])),*cash_lines('Ventas en efectivo',cash_fmt(d['cash_sales'])),*cash_lines('Ventas por Nequi',cash_fmt(d['nequi_sales'])),*cash_lines('Ventas fiadas',cash_fmt(d['credit_sales']))]
+            if d['cash_collections'] or d['nequi_collections']:
+                out += ['ABONOS RECIBIDOS',*cash_lines('Abonos en efectivo',cash_fmt(d['cash_collections'])),*cash_lines('Abonos por Nequi',cash_fmt(d['nequi_collections']))]
+            out += ['CUADRE DE EFECTIVO',*cash_lines('Efectivo de ventas','+ '+cash_fmt(d['cash_sales'])),*cash_lines('Abonos en efectivo','+ '+cash_fmt(d['cash_collections'])),*cash_lines('Devoluciones en efectivo','- '+cash_fmt(d['cash_refunds']))]
+            for move in d['moves']:
+                move_label='Salida / traslado efectivo' if move.get('kind')=='Ajuste efectivo y Nequi' else ('Entrada de efectivo' if move['amount']>=0 else 'Salida de efectivo')
+                out += [*cash_lines(move_label,signed(move['amount'])),*wrap(move['reason']),*wrap(f"{move['created']} · {move['operator']}")]
+            out += [*cash_lines('EFECTIVO ESPERADO SIN BASE',signed(d['expected_without_opening'])),*cash_lines('Base de apertura','+ '+cash_fmt(d['opening'])),*cash_lines('TOTAL A CONTAR EN CAJA',cash_fmt(d['expected_total']))]
+            if d['closed']: out += [row('Efectivo contado',cash_fmt(d['counted'])),row('DIFERENCIA',signed(d['counted']-d['expected_total']))]
         out += ['-'*width,*centered('Gracias por su compra'),'','','']; return '\n'.join(out)
     def smtp_send(self,msg):
         host=os.getenv('POS_SMTP_HOST'); require(host,'Configure el correo SMTP en el servidor')
@@ -821,7 +928,7 @@ class Handler(BaseHTTPRequestHandler):
             else: d={}
             if path=='/api/status' and not post:
                 with self.store.connect() as db: setup=not bool(db.execute('SELECT 1 FROM users WHERE active=1').fetchone())
-                return self.respond(200,{'setup':setup,'version':'3.3.6'})
+                return self.respond(200,{'setup':setup,'version':'3.3.8'})
             if path=='/api/setup' and post: return self.respond(200,self.store.setup(d))
             if path=='/api/login' and post:
                 key=self.client_address[0]; attempts=[x for x in self.attempts.get(key,[]) if x>time.time()-300]; require(len(attempts)<10,'Espere cinco minutos antes de intentar nuevamente'); attempts.append(time.time()); self.attempts[key]=attempts
@@ -840,6 +947,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/dispatch-sale' and not post: return self.respond(200,sale_options(self.store,u,b,int(q['id'][0])))
                 if path=='/api/logistics-command' and post: return self.respond(200,logistics_command(self.store,u,b,d['action'],d.get('data',{})))
                 if path=='/api/history' and not post: return self.respond(200,self.store.history(u,b,q.get('start',[today()])[0],q.get('end',[today()])[0]))
+                if path=='/api/customer-statement' and not post: return self.respond(200,self.store.customer_statement(u,b,int(q.get('id',['0'])[0])))
                 if path=='/api/dairy' and not post: require(b==1,'Módulo disponible en mini market'); return self.respond(200,dairy_state(self.store,u,q.get('start',[today()])[0],q.get('end',[today()])[0]))
                 if path=='/api/dairy-command' and post: require(b==1,'Módulo disponible en mini market'); return self.respond(200,dairy_command(self.store,u,d['action'],d.get('data',{})))
                 if path=='/api/dairy-report.xlsx' and not post:

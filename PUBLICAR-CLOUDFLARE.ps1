@@ -50,11 +50,18 @@ $SchemaText = [IO.File]::ReadAllText((Join-Path $Project 'schema.sql'))
 $BackupTables = [regex]::Matches($SchemaText, '(?im)^\s*CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)') |
   ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 if (-not $BackupTables.Count) { throw 'No se encontraron tablas reales para respaldar D1.' }
+$PendingMigrationTables = @('cash_nequi_reviews')
+$PreMigrationTables = @($BackupTables | Where-Object { $_ -notin $PendingMigrationTables })
 $BackupArguments = @('d1', 'export', 'comercio-local', '--remote', '--output', $D1Backup, '--config', 'cloudflare/wrangler.jsonc')
-foreach ($Table in $BackupTables) { $BackupArguments += @('--table', $Table) }
+foreach ($Table in $PreMigrationTables) { $BackupArguments += @('--table', $Table) }
 Invoke-Wrangler @BackupArguments
 Write-Host "Respaldo D1 creado: $D1Backup"
 Invoke-Wrangler d1 migrations apply comercio-local --remote --config cloudflare/wrangler.jsonc
+$PostMigrationBackup = Join-Path $BackupDirectory ('comercio-local-despues-migracion-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.sql')
+$PostBackupArguments = @('d1', 'export', 'comercio-local', '--remote', '--output', $PostMigrationBackup, '--config', 'cloudflare/wrangler.jsonc')
+foreach ($Table in $BackupTables) { $PostBackupArguments += @('--table', $Table) }
+Invoke-Wrangler @PostBackupArguments
+Write-Host "Respaldo D1 posterior a migraciones creado: $PostMigrationBackup"
 $ImportMarker = Join-Path $Project 'data\.cloud-imported'
 if ($ImportarDatosLocales -and -not (Test-Path $ImportMarker)) {
   & $Python scripts\export-d1.py
@@ -107,11 +114,11 @@ try {
 }
 
 Write-Host '7/7 Verificando la aplicacion publicada...'
-& $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.3.6'
+& $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.3.8'
 if ($LASTEXITCODE -ne 0) {
   Write-Host 'Cloudflare sigue respondiendo con la version anterior. Se repetira el despliegue del Worker...' -ForegroundColor Yellow
   $PublicUrl = Publish-Worker
-  & $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.3.6'
+  & $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.3.8'
   if ($LASTEXITCODE -ne 0) { throw "La aplicacion publicada en $PublicUrl no paso la verificacion despues de dos despliegues." }
 }
 [IO.File]::WriteAllText((Join-Path $Project 'cloudflare\deployment-url.txt'), $PublicUrl, [Text.UTF8Encoding]::new($false))

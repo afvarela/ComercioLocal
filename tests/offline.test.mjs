@@ -209,3 +209,84 @@ test("los estados de despacho cambian y quedan pendientes de sincronizar sin int
   assert.equal(state.dispatches[0].status, "Entregado");
   assert.equal(state.dispatches[0].offline, true);
 });
+
+test("crea un fiador local, registra la venta fiada y sincroniza sin duplicar referencias", async () => {
+  storage.clear();
+  navigator.onLine = false;
+  Object.defineProperty(globalThis, "fetch", {
+    value: async () => { throw new TypeError("offline"); },
+    configurable: true,
+  });
+  localStorage.setItem("pos-offline-session-v1", "1");
+  localStorage.setItem("pos-api-cache-v2", JSON.stringify({
+    "1:/api/state": {
+      user: { id: 7, name: "Ana" },
+      cash: { id: 4, user_id: 7 },
+      products: [{ id: 3, name: "Aceite", unit: "und", available: 10, stock: 10 }],
+      customers: [],
+    },
+    "1:/api/history?start=2026-11-02&end=2026-11-02": { sales: [], debts: [], receivable_moves: [] },
+  }));
+  const customerRequest = "offline-customer-123456789";
+  const customer = await api(1, "/api/command", {
+    action: "customer",
+    data: { name: "Cliente local", document: "12345", credit_limit: "", request_id: customerRequest },
+  });
+  assert.equal(customer.offline, true);
+  assert.ok(Number(customer.id) < 0);
+
+  const saleRequest = "offline-credit-sale-123456";
+  const sale = await api(1, "/api/command", {
+    action: "sale",
+    data: {
+      request_id: saleRequest,
+      customer_id: customer.id,
+      allow_credit: true,
+      due: "2026-11-20",
+      lines: [{ product_id: 3, qty: 1 }],
+      payments: [{ method: "Efectivo", amount: 0 }],
+      _offline: { total: 500000, operator: "Ana", customer: "Cliente local" },
+    },
+  });
+  assert.equal(sale.offline, true);
+  const localState = await api(1, "/api/state");
+  assert.equal(localState.customers[0].balance, 500000);
+  const localHistory = await api(1, "/api/history?start=2026-11-03&end=2026-11-03");
+  assert.equal(localHistory.debts[0].customer, "Cliente local");
+  assert.equal(localHistory.debts[0].debt, 500000);
+
+  const calls = [];
+  navigator.onLine = true;
+  Object.defineProperty(globalThis, "fetch", {
+    value: async (_url, options) => {
+      const body = JSON.parse(options.body);
+      calls.push(structuredClone(body));
+      const id = body.action === "customer" ? 45 : 99;
+      return new Response(JSON.stringify({ ok: true, id }), { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+    configurable: true,
+  });
+  const synced = await syncPendingSales();
+  assert.deepEqual(calls.map((body) => body.action), ["customer", "sale"]);
+  assert.equal(calls[1].data.customer_id, 45);
+  assert.deepEqual(synced, { synced: 2, pending: 0 });
+  assert.equal(pendingSales().length, 0);
+});
+
+test("una respuesta 503 guarda la venta en la cola local", async () => {
+  storage.clear();
+  navigator.onLine = true;
+  localStorage.setItem("pos-api-cache-v2", JSON.stringify({
+    "1:/api/state": { products: [{ id: 3, name: "Aceite", unit: "und", available: 2, stock: 2 }], customers: [] },
+  }));
+  Object.defineProperty(globalThis, "fetch", {
+    value: async () => new Response(JSON.stringify({ error: "D1 temporalmente no disponible" }), { status: 503, headers: { "Content-Type": "application/json" } }),
+    configurable: true,
+  });
+  const result = await api(1, "/api/command", {
+    action: "sale",
+    data: { request_id: "d1-paused-sale-123456", lines: [{ product_id: 3, qty: 1 }], payments: [], _offline: { total: 1000 } },
+  });
+  assert.equal(result.offline, true);
+  assert.equal(pendingSales()[0].requestId, "d1-paused-sale-123456");
+});

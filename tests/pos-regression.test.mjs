@@ -27,6 +27,30 @@ test("los formularios del POS no dependen del historial completo", () => {
   assert.doesNotMatch(source, /history\.debts\.find/);
 });
 
+test("clientes ofrece estado de cuenta y reporte diario de fiados", () => {
+  const page = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const printer = fs.readFileSync(new URL("../src/lib/printer.js", import.meta.url), "utf8");
+  assert.match(page, /Fiados del día/);
+  assert.match(page, /Imprimir estado de cuenta/);
+  assert.match(app, /\/api\/customer-statement\?id=/);
+  assert.match(printer, /TOTAL FIADO/);
+  assert.match(printer, /SALDO PENDIENTE/);
+});
+
+test("cierre separa base efectivo Nequi fiados y salida real", () => {
+  const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
+  const page = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  const style = fs.readFileSync(new URL("../public/style.css", import.meta.url), "utf8");
+  assert.match(form, /Total a contar en caja/);
+  assert.match(form, /pago en efectivo al proveedor de quesos/);
+  assert.match(page, /Efectivo del turno \(sin base\)/);
+  assert.match(page, /Total ventas \(efectivo \+ Nequi\)/);
+  assert.match(page, /c\.collected_sales_total/);
+  assert.match(page, /Ajuste de efectivo y Nequi/);
+  assert.match(style, /movement-filter-bar/);
+});
+
 test("la recepción vuelve a mostrar el costo guardado y refresca el inventario", () => {
   const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
@@ -123,4 +147,49 @@ test("la búsqueda remota tiene debounce y usa el índice FTS", () => {
   assert.match(migration, /tokenize='trigram remove_diacritics 1'/);
   assert.match(cleanMigration, /LIKE 'importado desde excel,%'/);
   assert.match(cleanMigration, /0013_clean_product_search/);
+});
+
+test("la búsqueda manual permanece y el escáner limpia el campo", () => {
+  const pos = fs.readFileSync(new URL("../src/pages/PointOfSale.jsx", import.meta.url), "utf8");
+  assert.match(pos, /if \(scanned\) \{[\s\S]*?setSearch\(""\)/);
+  assert.match(pos, /Boolean\(exact\?\.barcode && exact\.barcode === search\.trim\(\)\)/);
+  assert.doesNotMatch(pos, /onProduct\(id, index, \(\) => \{\s*setSearch\(""\)/);
+});
+
+test("inventario local queda bloqueado y recepción nunca muestra undefined", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const inventory = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
+  assert.match(app, /inventoryWriteActions/);
+  assert.match(app, /state\.degraded \|\| !online/);
+  assert.match(inventory, /Inventario bloqueado temporalmente/);
+  assert.match(inventory, /Buscar movimiento/);
+  assert.match(inventory, /Tipo de movimiento/);
+  assert.match(form, /: "unidad"/);
+  assert.doesNotMatch(form, /Costo por \$\{base\(receiving\?\.unit/);
+});
+
+test("clientes muestra búsqueda, fecha de venta y rango de fechas", () => {
+  const pages = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  assert.match(pages, /name="customer_debt_search"/);
+  assert.match(pages, /"Fecha de venta"/);
+  assert.match(pages, /saleDate >= debtStart/);
+  assert.match(pages, /saleDate <= debtEnd/);
+});
+
+test("etiquetas limpian la lista únicamente después de imprimir correctamente", () => {
+  const logistics = fs.readFileSync(new URL("../src/pages/Logistics.jsx", import.meta.url), "utf8");
+  assert.match(logistics, /await printLabels\(business, html\);\s*setItems\(\[\]\);/);
+});
+
+test("las ventas locales conservan detalle para reimprimir sin servidor", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const pages = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  const printer = fs.readFileSync(new URL("../src/lib/printer.js", import.meta.url), "utf8");
+  assert.match(app, /items: saleCart\.map/);
+  assert.match(app, /cartTotal,\s*lineTotal,/);
+  assert.match(app, /case "print_offline_sale"/);
+  assert.match(pages, /Reimprimir recibo local/);
+  assert.match(printer, /printOfflineSale/);
+  assert.doesNotMatch(printer.match(/export async function printOfflineSale[\s\S]*$/)?.[0] || "", /receipt\.txt/);
 });

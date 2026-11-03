@@ -111,6 +111,16 @@ class CommerceTests(unittest.TestCase):
         self.assertIn('Recibo de abono',self.store.receipt(1,'payment',r['id']))
         with self.assertRaises(ValueError): self.run_cmd('repay',{'sale_id':s['id'],'amount':6000,'method':'Efectivo'})
         self.assertEqual(self.store.state(self.u,1)['cash']['expected'],10300000)
+    def test_repayment_is_allowed_before_future_due_date(self):
+        p=self.product();self.lot(p);future=(date.today()+timedelta(days=30)).isoformat()
+        c=self.run_cmd('customer',{'name':'Cliente pago anticipado','credit_limit':0})['id']
+        sale=self.sale(p,1,0,customer_id=c,allow_credit=True,due=future)
+        self.run_cmd('repay',{'sale_id':sale['id'],'amount':2000,'method':'Nequi','request_id':uuid.uuid4().hex})
+        with self.assertRaises(ValueError): self.run_cmd('repay',{'sale_id':sale['id'],'amount':3001,'method':'Efectivo','request_id':uuid.uuid4().hex})
+        self.run_cmd('customer_payment',{'customer_id':c,'amount':3000,'method':'Efectivo','request_id':uuid.uuid4().hex,'allocations':[{'sale_id':sale['id'],'amount':3000}]})
+        with self.store.connect() as db:
+            self.assertEqual(tuple(db.execute('SELECT debt,due FROM sales WHERE id=?',(sale['id'],)).fetchone()),(0,future))
+            self.assertEqual(tuple(db.execute('SELECT paid_amount,balance,status FROM receivables WHERE sale_id=?',(sale['id'],)).fetchone()),(500000,0,'Pagado'))
     def test_blank_credit_limit_is_unlimited_and_sku_is_generated(self):
         product=self.run_cmd('product',{'sku':'','name':'Producto automático','unit':'und','price':5000})['id']
         self.lot(product,2)
@@ -344,5 +354,53 @@ class CommerceTests(unittest.TestCase):
         with self.store.connect() as db:
             saved=db.execute('SELECT lines,total FROM quotes WHERE id=?',(q['id'],)).fetchone()
             self.assertIn('OTROS',saved['lines']);self.assertEqual(saved['total'],250000)
+
+    def test_legacy_credit_without_receivable_is_repaired_before_payment(self):
+        p=self.product(price=10000);self.lot(p,2);customer=self.run_cmd('customer',{'name':'Cliente legado','credit_limit':50000})['id']
+        sale=self.sale(p,1,0,customer_id=customer,allow_credit=True,due=(date.today()+timedelta(days=30)).isoformat())
+        with self.store.connect() as db:
+            db.execute('DELETE FROM receivable_moves WHERE sale_id=?',(sale['id'],));db.execute('DELETE FROM receivables WHERE sale_id=?',(sale['id'],))
+        payment=self.run_cmd('customer_payment',{'customer_id':customer,'amount':4000,'method':'Nequi','request_id':uuid.uuid4().hex})
+        self.assertTrue(payment['id'])
+        with self.store.connect() as db:
+            account=db.execute('SELECT original_amount,paid_amount,balance,status FROM receivables WHERE sale_id=?',(sale['id'],)).fetchone()
+            self.assertEqual(tuple(account),(1000000,400000,600000,'Parcialmente pagado'))
+            self.assertEqual(db.execute('SELECT debt FROM sales WHERE id=?',(sale['id'],)).fetchone()[0],600000)
+
+    def test_cash_summary_separates_base_nequi_credit_and_supplier_withdrawal(self):
+        p=self.product(price=230000);self.lot(p,1);customer=self.run_cmd('customer',{'name':'Cliente caja','credit_limit':500000})['id']
+        self.sale(p,1,payments=[{'method':'Efectivo','amount':50000},{'method':'Nequi','amount':100000}],customer_id=customer,allow_credit=True,due=today())
+        cash=self.store.state(self.u,1)['cash']
+        self.assertEqual((cash['sales_total'],cash['collected_sales_total'],cash['cash_sales'],cash['nequi_sales'],cash['credit_sales']),(23000000,15000000,5000000,10000000,8000000))
+        self.assertEqual((cash['opening'],cash['expected_without_opening'],cash['expected_total']),(10000000,5000000,15000000))
+        with self.store.connect() as db:
+            plan=' '.join(row['detail'] for row in db.execute("EXPLAIN QUERY PLAN SELECT SUM(total) FROM sales WHERE cash_id=? AND status='active'",(cash['id'],)))
+        self.assertIn('idx_sales_cash_status',plan)
+        self.assertTrue(cash['nequi_review_required'])
+        with self.assertRaisesRegex(ValueError,'Revise primero'): self.run_cmd('close_cash',{'counted':150000})
+        request=uuid.uuid4().hex
+        first=self.run_cmd('cash_nequi_review',{'decision':'adjust','amount':80000,'reason':'Pago en efectivo al proveedor de quesos','request_id':request})
+        second=self.run_cmd('cash_nequi_review',{'decision':'adjust','amount':80000,'reason':'Pago en efectivo al proveedor de quesos','request_id':request})
+        self.assertEqual(first['id'],second['id'])
+        cash=self.store.state(self.u,1)['cash']
+        self.assertEqual((cash['adjustments_total'],cash['expected_without_opening'],cash['expected_total']),(8000000,-3000000,7000000))
+        closed=self.run_cmd('close_cash',{'counted':70000})
+        self.assertEqual(closed['difference'],0)
+        text=self.store.receipt_text(1,'cash',closed['id'])
+        self.assertIn('TOTAL VENTAS',text);self.assertIn('EFECTIVO ESPERADO SIN',text);self.assertIn('TOTAL A CONTAR EN CAJA',text);self.assertIn('DIFERENCIA',text)
+        self.assertIn('Salida / traslado',text);self.assertIn('Pago en efectivo al proveedor de',text)
+        self.assertNotIn('(control)',text);self.assertNotIn('(no es efectivo)',text);self.assertNotIn('Lácteo tercero',text)
+        receipt=self.store.receipt(1,'cash',closed['id'])
+        self.assertNotIn('El total de ventas incluye únicamente efectivo y Nequi',receipt)
+        self.assertEqual(receipt.count('Cierre:'),1)
+
+    def test_customer_statement_groups_products_and_totals(self):
+        p=self.product('Avena de fresa',price=6000);self.lot(p,3);customer=self.run_cmd('customer',{'name':'María Fiadora','document':'123','credit_limit':50000})['id']
+        self.sale(p,2,0,customer_id=customer,allow_credit=True,due=today())
+        self.run_cmd('customer_payment',{'customer_id':customer,'amount':5000,'method':'Efectivo','request_id':uuid.uuid4().hex})
+        statement=self.store.customer_statement(self.u,1,customer)
+        self.assertEqual((statement['total_credit'],statement['payments'],statement['balance']),(1200000,500000,700000))
+        self.assertEqual(statement['sales'][0]['lines'][0]['name'],'Avena de fresa')
+        self.assertEqual(statement['sales'][0]['lines'][0]['qty'],2)
 
 if __name__=='__main__': unittest.main(verbosity=2)

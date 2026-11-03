@@ -11,8 +11,15 @@ const cacheKey = (business, path) => `${business}:${path}`;
 const isStatePath = path => path.split("?")[0] === "/api/state";
 const offlineAction = (path, data) => path === "/api/command" ? data?.action : path === "/api/logistics-command" && data?.action === "status" ? "logistics_status" : "";
 const isOfflineSale = (path, data) => offlineAction(path, data) === "sale" && data?.data?.request_id;
-const isOfflineOperation = (path, data) => ["sale", "open_cash", "logistics_status"].includes(offlineAction(path, data));
+const isOfflineCustomer = (path, data) => offlineAction(path, data) === "customer" && !data?.data?.id && data?.data?.request_id;
+const isOfflineOperation = (path, data) => ["sale", "open_cash", "logistics_status"].includes(offlineAction(path, data)) || isOfflineCustomer(path, data);
 export const pendingSales = () => read(QUEUE, []);
+
+function localCustomerId(requestId) {
+  let hash = 0;
+  for (const character of String(requestId)) hash = (hash * 31 + character.charCodeAt(0)) | 0;
+  return -(Math.abs(hash) || 1);
+}
 
 async function pinVerifier(username, pin) {
   const bytes = new TextEncoder().encode(`comercio-local:${String(username).trim().toLowerCase()}:${pin}`);
@@ -48,6 +55,24 @@ function latestCached(cache, business, path) {
 export function projectOfflineState(value, business) {
   if (!value?.products) return value;
   const state = structuredClone(value);
+  state.customers ||= [];
+  for (const item of pendingSales().filter((entry) => entry.business === business && entry.action === "customer")) {
+    const localId = Number(item.localId || localCustomerId(item.requestId));
+    if (state.customers.some((customer) => Number(customer.id) === localId)) continue;
+    const data = item.data.data;
+    state.customers.push({
+      id: localId,
+      name: data.name,
+      document: data.document || "",
+      phone: data.phone || "",
+      email: data.email || "",
+      credit_limit: Math.round(Number(data.credit_limit || 0) * 100),
+      balance: 0,
+      total_purchases: 0,
+      purchase_count: 0,
+      offline: true,
+    });
+  }
   for (const sale of pendingSales().filter((item) => item.business === business)) {
     for (const line of sale.data?.data?.lines || []) {
       const product = state.products.find((item) => item.id === Number(line.product_id));
@@ -59,8 +84,11 @@ export function projectOfflineState(value, business) {
     if (sale.action === "sale" && sale.data?.data?.customer_id) {
       const customer = state.customers?.find((item) => item.id === Number(sale.data.data.customer_id));
       if (customer) {
-        customer.total_purchases = Number(customer.total_purchases || 0) + Number(sale.data.data._offline?.total || 0);
+        const total = Number(sale.data.data._offline?.total || 0);
+        const paid = (sale.data.data.payments || []).reduce((sum, payment) => sum + Math.round(Number(payment.amount || 0) * 100), 0);
+        customer.total_purchases = Number(customer.total_purchases || 0) + total;
         customer.purchase_count = Number(customer.purchase_count || 0) + 1;
+        customer.balance = Number(customer.balance || 0) + Math.max(0, total - paid);
       }
     }
   }
@@ -89,18 +117,62 @@ function projectedHistory(value, business) {
     });
   }
   const localSales = pendingSales().filter((item) => item.business === business && item.action === "sale");
+  history.debts ||= [];
+  history.receivable_moves ||= [];
+  history.credit_sales ||= [];
   for (const item of localSales) {
     if (history.sales.some((sale) => sale.request_id === item.requestId)) continue;
     const meta = item.data.data._offline || {};
-    const paid = (item.data.data.payments || []).reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+    const paid = (item.data.data.payments || []).reduce((sum, payment) => sum + Math.round(Number(payment.amount || 0) * 100), 0);
     const total = Number(meta.total || 0);
+    const debt = Math.max(0, total - paid);
+    const customer = state?.customers?.find((entry) => Number(entry.id) === Number(item.data.data.customer_id));
     history.sales.unshift({
       id: item.requestId, request_id: item.requestId, number: "LOCAL", created: item.created,
       operator: meta.operator || state?.user?.name || "Usuario local",
-      customer: meta.customer || null, total, cost: 0,
-      debt: Math.max(0, total - paid), original_debt: Math.max(0, total - paid),
+      customer: meta.customer || customer?.name || null, customer_id: item.data.data.customer_id || null, total, cost: 0,
+      debt, original_debt: debt,
       status: "local", offline: true,
     });
+    if (debt && !history.debts.some((entry) => entry.request_id === item.requestId)) {
+      history.debts.unshift({
+        id: item.requestId,
+        request_id: item.requestId,
+        number: "LOCAL",
+        created: item.created,
+        customer_id: item.data.data.customer_id,
+        customer: meta.customer || customer?.name || "Cliente local",
+        document: customer?.document || "",
+        phone: customer?.phone || "",
+        due: item.data.data.due,
+        debt,
+        original_debt: debt,
+        status: "local",
+        offline: true,
+      });
+      history.receivable_moves.unshift({
+        id: `${item.requestId}:credito`,
+        created: item.created,
+        customer: meta.customer || customer?.name || "Cliente local",
+        kind: "Venta fiada local",
+        amount: debt,
+        balance_after: debt,
+        note: "Pendiente de sincronizar",
+        offline: true,
+      });
+      history.credit_sales.unshift({
+        id: item.requestId,
+        request_id: item.requestId,
+        number: "LOCAL",
+        created: item.created,
+        customer_id: item.data.data.customer_id,
+        customer: meta.customer || customer?.name || "Cliente local",
+        original_debt: debt,
+        debt,
+        status: "local",
+        offline: true,
+      });
+    }
   }
   return history;
 }
@@ -120,13 +192,54 @@ function validateOfflineStock(business, data) {
   }
 }
 
+function validateOfflineCredit(business, data) {
+  if (!data.data.allow_credit) return;
+  const cache = read(CACHE, {}), base = structuredClone(cache[cacheKey(business, "/api/state")] || {});
+  if (!base.products?.length) base.products = cachedCatalog(business);
+  const state = projectOfflineState(base, business);
+  const customer = state.customers?.find((item) => Number(item.id) === Number(data.data.customer_id));
+  if (!customer) throw Error("El cliente fiador no está disponible en la copia local");
+  const total = Number(data.data._offline?.total || 0);
+  const paid = (data.data.payments || []).reduce((sum, payment) => sum + Math.round(Number(payment.amount || 0) * 100), 0);
+  const debt = Math.max(0, total - paid);
+  if (!debt) return;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(data.data.due || ""))) throw Error("Indica la fecha acordada del fiado");
+  if (customer.credit_limit && Number(customer.balance || 0) + debt > Number(customer.credit_limit))
+    throw Error("El saldo excede el cupo de crédito del cliente");
+}
+
 function enqueueOperation(business, path, data, reason) {
   const queue = pendingSales();
   const action = offlineAction(path, data);
   const requestId = data.data.request_id || `${action}-${crypto.randomUUID()}`;
   const existing = queue.find((item) => item.business === business && item.requestId === requestId);
-  if (existing) return { offline: true, id: existing.requestId, change: 0, duplicate: true };
-  if (action === "sale") validateOfflineStock(business, data);
+  if (existing) return { offline: true, id: existing.localId || existing.requestId, change: 0, duplicate: true };
+  if (action === "sale") {
+    validateOfflineStock(business, data);
+    validateOfflineCredit(business, data);
+  }
+  let localId = null;
+  if (action === "customer") {
+    localId = localCustomerId(requestId);
+    const cache = read(CACHE, {});
+    for (const key of Object.keys(cache).filter((name) => name.startsWith(`${business}:/api/state`))) {
+      const state = cache[key];
+      state.customers ||= [];
+      if (!state.customers.some((customer) => Number(customer.id) === localId)) state.customers.push({
+        id: localId,
+        name: data.data.name,
+        document: data.data.document || "",
+        phone: data.data.phone || "",
+        email: data.data.email || "",
+        credit_limit: Math.round(Number(data.data.credit_limit || 0) * 100),
+        balance: 0,
+        total_purchases: 0,
+        purchase_count: 0,
+        offline: true,
+      });
+    }
+    write(CACHE, cache);
+  }
   if (action === "open_cash") {
     const cache = read(CACHE, {}), key = cacheKey(business, "/api/state"), state = cache[key];
     if (!state) throw Error("Abre la aplicación con Internet al menos una vez antes de trabajar sin conexión");
@@ -153,10 +266,10 @@ function enqueueOperation(business, path, data, reason) {
     cache[key] = logistics;
     write(CACHE, cache);
   }
-  queue.push({ business, path, data, action, requestId, created: new Date().toISOString(), error: reason });
+  queue.push({ business, path, data, action, requestId, localId, created: new Date().toISOString(), error: reason });
   write(QUEUE, queue);
   window.dispatchEvent(new Event("pos-queue-change"));
-  return { offline: true, id: requestId, change: 0 };
+  return { offline: true, id: localId || requestId, change: 0 };
 }
 
 async function request(business, path, data) {
@@ -215,7 +328,7 @@ export async function api(business, path, data) {
       localStorage.removeItem(LOCAL_SESSION);
       return { ok: true, offline: true };
     }
-    if (isOfflineOperation(path, data) && (!navigator.onLine || !error.status)) return enqueueOperation(business, path, data, error.message);
+    if (isOfflineOperation(path, data) && (!navigator.onLine || !error.status || error.status === 503)) return enqueueOperation(business, path, data, error.message);
     if (data === undefined && (!navigator.onLine || !error.status || error.status === 503)) {
       const cached = latestCached(read(CACHE, {}), business, path);
       if (cached !== undefined) {
@@ -264,7 +377,24 @@ export async function syncPendingSales() {
   let synced = 0;
   for (let index = 0; index < queue.length; index += 1) {
     const item = queue[index];
-    try { await request(item.business, item.path, item.data); synced += 1; }
+    try {
+      const result = await request(item.business, item.path, item.data);
+      if (item.action === "customer" && result?.id) {
+        const localId = Number(item.localId || localCustomerId(item.requestId));
+        const remoteId = Number(result.id);
+        for (const pending of queue.slice(index + 1)) {
+          if (pending.business === item.business && pending.action === "sale" && Number(pending.data?.data?.customer_id) === localId)
+            pending.data.data.customer_id = remoteId;
+        }
+        const cache = read(CACHE, {});
+        for (const key of Object.keys(cache).filter((name) => name.startsWith(`${item.business}:/api/state`))) {
+          const customer = cache[key]?.customers?.find((entry) => Number(entry.id) === localId);
+          if (customer) Object.assign(customer, { id: remoteId, offline: false });
+        }
+        write(CACHE, cache);
+      }
+      synced += 1;
+    }
     catch (error) {
       if (item.action === "open_cash" && error.status === 400 && /caja abierta/i.test(error.message)) {
         synced += 1;
