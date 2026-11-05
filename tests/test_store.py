@@ -157,7 +157,7 @@ class CommerceTests(unittest.TestCase):
         p=self.product();self.lot(p)
         d={'request_id':uuid.uuid4().hex,'lines':[{'product_id':p,'qty':1}],'payments':[{'method':'Efectivo','amount':5000}]}
         one=self.run_cmd('sale',d); two=self.run_cmd('sale',d)
-        self.assertEqual(one['id'],two['id']);self.assertEqual(self.store.state(self.u,1)['products'][0]['available'],9)
+        self.assertEqual(one['id'],two['id']);self.assertEqual((one['number'],one['created']),(two['number'],two['created']));self.assertEqual(self.store.state(self.u,1)['products'][0]['available'],9)
     def test_void_reverses_stock_cash_and_debt(self):
         p=self.product();self.lot(p)
         c=self.run_cmd('customer',{'name':'Juan','credit_limit':10000})['id']
@@ -298,6 +298,13 @@ class CommerceTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT debt FROM sales WHERE id=?',(second['id'],)).fetchone()[0],0)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM collections WHERE request_id=?',(request,)).fetchone()[0],1)
 
+    def test_history_assigns_utc_sale_to_the_colombia_calendar_day(self):
+        p=self.product();self.lot(p);sale=self.sale(p)
+        with self.store.connect() as db:
+            db.execute("UPDATE sales SET created='2026-11-04T02:30:00+00:00' WHERE id=?",(sale['id'],))
+        self.assertEqual(len(self.store.history(self.u,1,'2026-11-03','2026-11-03')['sales']),1)
+        self.assertEqual(self.store.history(self.u,1,'2026-11-04','2026-11-04')['sales'],[])
+
     def test_cash_difference_requires_classification(self):
         with self.assertRaises(ValueError): self.run_cmd('close_cash',{'counted':99999})
         closed=self.run_cmd('close_cash',{'counted':99999,'difference_reason':'Error de conteo'})
@@ -393,6 +400,22 @@ class CommerceTests(unittest.TestCase):
         receipt=self.store.receipt(1,'cash',closed['id'])
         self.assertNotIn('El total de ventas incluye únicamente efectivo y Nequi',receipt)
         self.assertEqual(receipt.count('Cierre:'),1)
+
+    def test_cash_summary_discounts_returns_from_cash_and_nequi_sales(self):
+        cash_product=self.product('Venta efectivo',price=10000);self.lot(cash_product,1)
+        nequi_product=self.product('Venta Nequi',price=20000);self.lot(nequi_product,1)
+        cash_sale=self.sale(cash_product,1,payments=[{'method':'Efectivo','amount':10000}])
+        nequi_sale=self.sale(nequi_product,1,payments=[{'method':'Nequi','amount':20000}])
+        history=self.store.history(self.u,1,today(),today())
+        cash_line=next(line for line in history['sale_lines'] if line['sale_id']==cash_sale['id'])
+        nequi_line=next(line for line in history['sale_lines'] if line['sale_id']==nequi_sale['id'])
+        self.run_cmd('sale_return',{'sale_line_id':cash_line['id'],'qty':1,'method':'Efectivo','restock':'1','reason':'Devolución total','request_id':uuid.uuid4().hex})
+        self.run_cmd('sale_return',{'sale_line_id':nequi_line['id'],'qty':1,'method':'Nequi','restock':'1','reason':'Devolución total','request_id':uuid.uuid4().hex})
+        cash=self.store.state(self.u,1)['cash']
+        self.assertEqual((cash['cash_sales'],cash['cash_refunds'],cash['cash_sales_net']),(1000000,1000000,0))
+        self.assertEqual((cash['nequi_sales'],cash['nequi_refunds'],cash['nequi_sales_net'],cash['nequi_total']),(2000000,2000000,0,0))
+        self.assertEqual(cash['collected_sales_total'],0)
+        self.assertEqual(cash['expected_without_opening'],0)
 
     def test_customer_statement_groups_products_and_totals(self):
         p=self.product('Avena de fresa',price=6000);self.lot(p,3);customer=self.run_cmd('customer',{'name':'María Fiadora','document':'123','credit_limit':50000})['id']

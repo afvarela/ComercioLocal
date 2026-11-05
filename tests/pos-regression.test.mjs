@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { validateInventoryQuantity } from "../src/lib/cartInventory.js";
+import { accountStatementHtml } from "../src/lib/printer.js";
 
 const product = { id: 7, name: "Arroz", unit: "und", available: 3 };
 
@@ -30,12 +31,38 @@ test("los formularios del POS no dependen del historial completo", () => {
 test("clientes ofrece estado de cuenta y reporte diario de fiados", () => {
   const page = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
-  const printer = fs.readFileSync(new URL("../src/lib/printer.js", import.meta.url), "utf8");
+  const preview = fs.readFileSync(new URL("../src/components/AccountStatement.jsx", import.meta.url), "utf8");
   assert.match(page, /Fiados del día/);
   assert.match(page, /Imprimir estado de cuenta/);
   assert.match(app, /\/api\/customer-statement\?id=/);
-  assert.match(printer, /TOTAL FIADO/);
-  assert.match(printer, /SALDO PENDIENTE/);
+  assert.match(app, /type: "account_statement"/);
+  assert.match(preview, /Imprimir \/ guardar PDF/);
+  assert.match(preview, /srcDoc=\{html\}/);
+});
+
+test("estado de cuenta muestra facturas y productos sin repetir fiado ni saldo por compra", () => {
+  const html = accountStatementHtml("Tienda El Descanso", {
+    customer: { name: "Cliente prueba", document: "123" },
+    sales: [{
+      number: 15,
+      created: "2026-11-04T14:30:00.000Z",
+      lines: [{ name: "Aguacate", qty: 222, unit: "g", price: 800000, price_basis: 500, total: 355200 }],
+      original_debt: 355200,
+      debt: 155200,
+    }],
+    total_credit: 355200,
+    payments: 200000,
+    returns: 0,
+    balance: 155200,
+  });
+  assert.match(html, /Factura #000015/);
+  assert.match(html, /Fecha:/);
+  assert.match(html, /Aguacate/);
+  assert.match(html, /222 g/);
+  assert.match(html, /\$\s3\.552/);
+  assert.match(html, /Saldo pendiente/);
+  assert.doesNotMatch(html, /Fiado de la compra/);
+  assert.doesNotMatch(html, /Saldo de la compra/);
 });
 
 test("cierre separa base efectivo Nequi fiados y salida real", () => {

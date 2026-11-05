@@ -611,7 +611,12 @@ export function Cash({ state, history, business, admin, onAction }) {
             {
               label: "Total ventas (efectivo + Nequi)",
               value: cop(c.collected_sales_total || 0),
-              note: `Efectivo ${cop(c.cash_sales || 0)} · Nequi ${cop(c.nequi_sales || 0)} · Fiado aparte ${cop(c.credit_sales || 0)}`,
+              note: `Efectivo neto ${cop(c.cash_sales_net ?? c.cash_sales ?? 0)} · Nequi neto ${cop(c.nequi_sales_net ?? c.nequi_sales ?? 0)} · Fiado aparte ${cop(c.credit_sales || 0)}`,
+            },
+            {
+              label: "Nequi recibido en el turno",
+              value: cop(c.nequi_total || 0),
+              note: `Ventas netas ${cop(c.nequi_sales_net ?? c.nequi_sales ?? 0)} + abonos ${cop(c.nequi_collections || 0)}${c.nequi_refunds ? ` · devoluciones ${cop(c.nequi_refunds)}` : ""}. No se cuenta como efectivo.`,
             },
             {
               label: "Efectivo del turno (sin base)",
@@ -627,7 +632,7 @@ export function Cash({ state, history, business, admin, onAction }) {
             {
               label: "Total a contar en caja",
               value: cop(c.expected_total ?? c.expected),
-              note: `Nequi ${cop(c.nequi_total || 0)} · Fiado ${cop(c.credit_sales || 0)}`,
+              note: "Solo dinero efectivo: base + cobros en efectivo + movimientos - salidas.",
             },
           ]}
         />
@@ -737,7 +742,7 @@ export function Sales({
           ]}
           rows={sales.map((s) => [
             <>
-              {s.offline ? `LOCAL-${String(s.request_id).slice(-6).toUpperCase()}` : saleNumber(s, business)}
+              {s.offline ? `LOCAL-${String(s.request_id).slice(-6).toUpperCase()}` : s.synced_local ? `SYNC-${String(s.request_id).slice(-6).toUpperCase()}` : saleNumber(s, business)}
               <small>
                 {dt(s.created)} · {s.operator}
               </small>
@@ -746,12 +751,15 @@ export function Sales({
             cop(s.receipt_total ?? s.total),
             <>{s.payment_methods || (s.debt ? "Fiado" : "-")}{!!s.cash_received && <small>Recibido: {cop(s.cash_received)} / cambio: {cop(s.change_given)}</small>}</>,
             cop(s.debt),
-            <Badge tone={s.offline ? "warn" : s.status === "void" ? "red" : ""}>
-              {s.offline ? "LOCAL · pendiente" : s.status === "void" ? "Anulada" : "Registrada"}
+            <Badge tone={s.offline || s.synced_local ? "warn" : s.status === "void" ? "red" : ""}>
+              {s.offline ? "LOCAL · pendiente" : s.synced_local ? "Sincronizada · verificando historial" : s.status === "void" ? "Anulada" : "Registrada"}
             </Badge>,
             <div className="actions">
               {s.offline && <Button onClick={() => onAction("print_offline_sale", s.request_id)}>
                 Reimprimir recibo local
+              </Button>}
+              {(s.synced_local || s.local_copy) && <Button onClick={() => onAction("print_offline_sale", s.request_id)}>
+                Reimprimir copia local
               </Button>}
               {!s.offline && <Button onClick={() => onAction("receipt_sale", s.id)}>
                 Ver recibo

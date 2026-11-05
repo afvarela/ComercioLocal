@@ -39,18 +39,23 @@ export async function printReceipt(business, kind, id) {
     body: JSON.stringify({ printer, text: await r.text() }),
   });
 }
-export async function printAccountStatement(businessName, statement) {
-  const printer = selectedPrinter();
-  if (!printer) throw Error("No hay una impresora de recibos configurada en este equipo");
-  const width = 38, money = (value) => cop(Number(value || 0)), wrap = (value) => {
-    const words=String(value||"").split(/\s+/),result=[];let line="";
-    for(const word of words){const next=line?`${line} ${word}`:word;if(next.length>width&&line){result.push(line);line=word}else line=next}if(line)result.push(line);return result;
-  }, row=(label,value)=>{const right=String(value),left=String(label).slice(0,Math.max(1,width-right.length-1));return left.padEnd(width-right.length)+right;};
-  const lines=[...wrap(businessName.toUpperCase()).map(x=>x.padStart(Math.floor((width+x.length)/2))),"ESTADO DE CUENTA",statement.customer.name,`CC/NIT: ${statement.customer.document||"Sin documento"}`,"-".repeat(width)];
-  let currentDate="";
-  for(const sale of statement.sales||[]){const day=String(sale.created||"").slice(0,10);if(day!==currentDate){if(currentDate)lines.push("-".repeat(width));lines.push(`FECHA ${day}`);currentDate=day;}const saleCode=Number.isFinite(Number(sale.number))?String(sale.number).padStart(6,"0"):String(sale.number||"LOCAL");lines.push(`Factura #${saleCode}`);for(const item of sale.lines||[]){lines.push(...wrap(item.name));const quantityText=qty(item.qty,item.unit),basis=item.unit==="g"?(Number(item.price_basis)===500?"/libra":"/kg"):`/${item.unit}`;lines.push(row(`${quantityText} ${item.unit} x ${money(item.price)}${basis}`,money(item.total)));}lines.push(row("Fiado de la compra",money(sale.original_debt)),row("Saldo de la compra",money(sale.debt)));}
-  lines.push("=".repeat(width),row("TOTAL FIADO",money(statement.total_credit)),row("(-) ABONOS",money(statement.payments)),...(statement.returns?[row("(-) DEVOLUCIONES",money(statement.returns))]:[]),row("SALDO PENDIENTE",money(statement.balance)),"",...wrap("Estado de cuenta interno. Conserve este comprobante."),"","","");
-  return call("/print", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ printer, text: lines.join("\n") }) });
+export function accountStatementHtml(businessName, statement) {
+  const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
+  const money = (value) => escape(cop(Number(value || 0)));
+  const date = (value) => {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.valueOf()) ? escape(value) : escape(parsed.toLocaleDateString("es-CO", { timeZone: "America/Bogota", year: "numeric", month: "2-digit", day: "2-digit" }));
+  };
+  const sales = (statement.sales || []).map((sale) => {
+    const saleCode = Number.isFinite(Number(sale.number)) ? String(sale.number).padStart(6, "0") : String(sale.number || "LOCAL");
+    const rows = (sale.lines || []).map((item) => {
+      const quantityText = `${qty(item.qty, item.unit)} ${item.unit}`;
+      const basis = item.unit === "g" ? (Number(item.price_basis) === 500 ? "libra" : "kg") : item.unit;
+      return `<tr><td>${escape(item.name)}</td><td>${escape(quantityText)}</td><td>${money(item.price)} / ${escape(basis)}</td><td>${money(item.total)}</td></tr>`;
+    }).join("");
+    return `<section class="sale"><div class="sale-head"><b>Factura #${escape(saleCode)}</b><span>Fecha: ${date(sale.created)}</span></div><table><thead><tr><th>Producto</th><th>Cantidad</th><th>Precio</th><th>Valor</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+  }).join("");
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Estado de cuenta</title><style>*{box-sizing:border-box}body{font:12px Arial,sans-serif;width:72mm;margin:6mm auto;color:#111}header{text-align:center;margin-bottom:16px}h1{font-size:18px;margin:0 0 5px}h2{font-size:15px;margin:0 0 10px}.customer{line-height:1.5}.sale{border-top:1px dashed #555;padding-top:9px;margin-top:11px;break-inside:avoid}.sale-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:7px}table{border-collapse:collapse;width:100%;font-size:10px;table-layout:fixed}th,td{padding:4px 2px;border-bottom:1px solid #ddd;vertical-align:top;overflow-wrap:anywhere}th{text-align:left}th:nth-child(1),td:nth-child(1){width:34%}th:nth-child(2),td:nth-child(2){width:18%}th:nth-child(3),td:nth-child(3){width:25%}th:nth-child(4),td:nth-child(4){width:23%;text-align:right}.summary{border-top:2px solid #111;margin-top:15px;padding-top:8px}.summary p{display:flex;justify-content:space-between;gap:10px;margin:5px 0}.balance{font-size:14px;font-weight:bold}.note{text-align:center;font-size:10px;margin-top:14px}@page{size:80mm auto;margin:4mm}@media print{body{margin:0;width:auto}}</style></head><body><header><h1>${escape(String(businessName).toUpperCase())}</h1><h2>ESTADO DE CUENTA</h2><div class="customer"><b>${escape(statement.customer?.name)}</b><br>CC/NIT: ${escape(statement.customer?.document || "Sin documento")}</div></header>${sales}<div class="summary"><p><span>Total fiado</span><b>${money(statement.total_credit)}</b></p><p><span>Abonos</span><b>- ${money(statement.payments)}</b></p>${statement.returns ? `<p><span>Devoluciones</span><b>- ${money(statement.returns)}</b></p>` : ""}<p class="balance"><span>Saldo pendiente</span><b>${money(statement.balance)}</b></p></div><p class="note">Estado de cuenta interno.</p></body></html>`;
 }
 export async function printDispatch(business, id) {
   const printer = selectedDispatchPrinter();

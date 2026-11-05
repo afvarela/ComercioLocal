@@ -1,12 +1,23 @@
 import { cachedCatalog, syncCatalog as syncCatalogStore } from "./catalog.js";
 const CACHE = "pos-api-cache-v2";
 const QUEUE = "pos-offline-sales-v2";
+const SYNCED_SALES = "pos-offline-synced-sales-v1";
 const AUTH = "pos-offline-auth-v1";
 const LOCAL_SESSION = "pos-offline-session-v1";
 const read = (key, fallback) => {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
 };
 const write = (key, value) => localStorage.setItem(key, JSON.stringify(value));
+function persistQueue(queue) {
+  try {
+    write(QUEUE, queue);
+    const saved = read(QUEUE, null);
+    if (!Array.isArray(saved) || saved.length !== queue.length || queue.some((item, index) => saved[index]?.requestId !== item.requestId))
+      throw Error("La copia local no pudo verificarse");
+  } catch (error) {
+    throw Error(`No fue posible guardar la operación de forma segura en este equipo: ${error.message}`);
+  }
+}
 const cacheKey = (business, path) => `${business}:${path}`;
 const isStatePath = path => path.split("?")[0] === "/api/state";
 const offlineAction = (path, data) => path === "/api/command" ? data?.action : path === "/api/logistics-command" && data?.action === "status" ? "logistics_status" : "";
@@ -14,6 +25,29 @@ const isOfflineSale = (path, data) => offlineAction(path, data) === "sale" && da
 const isOfflineCustomer = (path, data) => offlineAction(path, data) === "customer" && !data?.data?.id && data?.data?.request_id;
 const isOfflineOperation = (path, data) => ["sale", "open_cash", "logistics_status"].includes(offlineAction(path, data)) || isOfflineCustomer(path, data);
 export const pendingSales = () => read(QUEUE, []);
+const recentlySyncedSales = () => read(SYNCED_SALES, []);
+export const savedLocalSale = (business, requestId) =>
+  [...pendingSales(), ...recentlySyncedSales()].find((item) => item.business === business && item.action === "sale" && item.requestId === requestId);
+
+function colombiaDay(value = new Date()) {
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.valueOf())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Bogota", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(parsed);
+}
+
+function requestedHistoryRange(path) {
+  const query = new URLSearchParams(String(path).split("?", 2)[1] || "");
+  const day = colombiaDay();
+  return { start: query.get("start") || day, end: query.get("end") || query.get("start") || day };
+}
+
+function belongsToHistory(item, path) {
+  const { start, end } = requestedHistoryRange(path);
+  const day = item.localDay || colombiaDay(item.created);
+  return day >= start && day <= end;
+}
 
 function localCustomerId(requestId) {
   let hash = 0;
@@ -49,7 +83,21 @@ function latestCached(cache, business, path) {
   if (!path.startsWith("/api/history?")) return undefined;
   const prefix = `${business}:/api/history?`;
   const latest = Object.keys(cache).filter((key) => key.startsWith(prefix)).sort().at(-1);
-  return latest ? cache[latest] : undefined;
+  if (!latest) return undefined;
+  const fallback = structuredClone(cache[latest]);
+  for (const key of ["sales", "credit_sales", "sale_lines", "sale_payments", "stock_moves", "payments", "top", "audit", "cash_moves"])
+    if (Array.isArray(fallback[key])) fallback[key] = [];
+  return fallback;
+}
+
+function rememberSavedSale(business, path, data, result, localRecord = {}) {
+  if (!isOfflineSale(path, data) || !result?.id) return;
+  const requestId = data.data.request_id;
+  const recent = recentlySyncedSales().filter((entry) => !(entry.business === business && entry.requestId === requestId));
+  const syncedAt = new Date().toISOString();
+  const created = localRecord.created || result.created || syncedAt;
+  recent.unshift({ business, path, data, action: "sale", requestId, ...localRecord, created, localDay: localRecord.localDay || colombiaDay(created), number: result.number ?? localRecord.number, syncedId: result.id, syncedAt });
+  write(SYNCED_SALES, recent.slice(0, 200));
 }
 
 export function projectOfflineState(value, business) {
@@ -95,12 +143,12 @@ export function projectOfflineState(value, business) {
   return state;
 }
 
-function projectedHistory(value, business) {
+function projectedHistory(value, business, path) {
   if (!value?.sales) return value;
   const history = structuredClone(value);
   const cache = read(CACHE, {}), state = cache[cacheKey(business, "/api/state")];
   history.cash_sessions ||= [];
-  const localOpenings = pendingSales().filter((item) => item.business === business && item.action === "open_cash");
+  const localOpenings = pendingSales().filter((item) => item.business === business && item.action === "open_cash" && belongsToHistory(item, path));
   for (const item of localOpenings) {
     if (history.cash_sessions.some((cash) => String(cash.id) === String(item.requestId))) continue;
     const opening = Math.round(Number(item.data.data.opening || 0) * 100);
@@ -116,7 +164,18 @@ function projectedHistory(value, business) {
       offline: true,
     });
   }
-  const localSales = pendingSales().filter((item) => item.business === business && item.action === "sale");
+  const confirmedRequests = new Set(history.sales.map((sale) => sale.request_id).filter(Boolean));
+  const recent = recentlySyncedSales();
+  const cutoff = Date.now() - 7 * 86400000;
+  const retainedRecent = recent.filter((item) => new Date(item.syncedAt || item.created).valueOf() >= cutoff).slice(0, 200);
+  if (retainedRecent.length !== recent.length) write(SYNCED_SALES, retainedRecent);
+  const localCopies = new Set(retainedRecent.map((item) => item.requestId));
+  for (const sale of history.sales) if (localCopies.has(sale.request_id)) sale.local_copy = true;
+  const stillRecent = retainedRecent.filter((item) => !confirmedRequests.has(item.requestId));
+  const localSales = [
+    ...pendingSales().filter((item) => item.business === business && item.action === "sale"),
+    ...stillRecent.filter((item) => item.business === business),
+  ].filter((item) => belongsToHistory(item, path));
   history.debts ||= [];
   history.receivable_moves ||= [];
   history.credit_sales ||= [];
@@ -127,12 +186,13 @@ function projectedHistory(value, business) {
     const total = Number(meta.total || 0);
     const debt = Math.max(0, total - paid);
     const customer = state?.customers?.find((entry) => Number(entry.id) === Number(item.data.data.customer_id));
+    const synced = Boolean(item.syncedId);
     history.sales.unshift({
-      id: item.requestId, request_id: item.requestId, number: "LOCAL", created: item.created,
+      id: synced ? item.syncedId : item.requestId, request_id: item.requestId, number: synced ? item.number ?? null : "LOCAL", created: item.created,
       operator: meta.operator || state?.user?.name || "Usuario local",
       customer: meta.customer || customer?.name || null, customer_id: item.data.data.customer_id || null, total, cost: 0,
       debt, original_debt: debt,
-      status: "local", offline: true,
+      status: synced ? "active" : "local", offline: !synced, synced_local: synced,
     });
     if (debt && !history.debts.some((entry) => entry.request_id === item.requestId)) {
       history.debts.unshift({
@@ -266,8 +326,9 @@ function enqueueOperation(business, path, data, reason) {
     cache[key] = logistics;
     write(CACHE, cache);
   }
-  queue.push({ business, path, data, action, requestId, localId, created: new Date().toISOString(), error: reason });
-  write(QUEUE, queue);
+  const created = new Date().toISOString();
+  queue.push({ business, path, data, action, requestId, localId, created, localDay: colombiaDay(created), error: reason });
+  persistQueue(queue);
   window.dispatchEvent(new Event("pos-queue-change"));
   return { offline: true, id: localId || requestId, change: 0 };
 }
@@ -312,6 +373,9 @@ export async function api(business, path, data) {
   }
   try {
     const result = await request(business, path, data);
+    if (isOfflineSale(path, data)) {
+      try { rememberSavedSale(business, path, data, result); } catch { /* D1 ya confirmó la venta; no se fuerza un reintento duplicado. */ }
+    }
     if (path === "/api/login" && data) await saveOfflineLogin(data);
     if (path === "/api/logout") localStorage.removeItem(LOCAL_SESSION);
     if (data === undefined) {
@@ -321,7 +385,7 @@ export async function api(business, path, data) {
       write(CACHE, cache);
       if (isStatePath(path)) localStorage.setItem(LOCAL_SESSION, "1");
     }
-    return result;
+    return path.startsWith("/api/history?") ? projectedHistory(result, business, path) : result;
   } catch (error) {
     if (path === "/api/login" && data && !error.status) return offlineLogin(data);
     if (path === "/api/logout" && data && !error.status) {
@@ -338,7 +402,7 @@ export async function api(business, path, data) {
           throw denied;
         }
         if (isStatePath(path)) return { ...projectOfflineState(cached, business), degraded: error.status === 503 };
-        if (path.startsWith("/api/history?")) return projectedHistory(cached, business);
+        if (path.startsWith("/api/history?")) return projectedHistory(cached, business, path);
         return cached;
       }
     }
@@ -379,6 +443,9 @@ export async function syncPendingSales() {
     const item = queue[index];
     try {
       const result = await request(item.business, item.path, item.data);
+      if (item.action === "sale") {
+        rememberSavedSale(item.business, item.path, item.data, result, item);
+      }
       if (item.action === "customer" && result?.id) {
         const localId = Number(item.localId || localCustomerId(item.requestId));
         const remoteId = Number(result.id);
@@ -404,7 +471,7 @@ export async function syncPendingSales() {
       if (!error.status) { remaining.push(...queue.slice(index + 1)); break; }
     }
   }
-  write(QUEUE, remaining);
+  persistQueue(remaining);
   window.dispatchEvent(new Event("pos-queue-change"));
   return { synced, pending: remaining.length };
 }

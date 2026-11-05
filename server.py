@@ -219,6 +219,7 @@ class Store:
           COALESCE(SUM(CASE WHEN method='Efectivo' AND kind='Abono' THEN amount ELSE 0 END),0) cash_collections,
           COALESCE(SUM(CASE WHEN method='Nequi' AND kind='Abono' THEN amount ELSE 0 END),0) nequi_collections,
           COALESCE(SUM(CASE WHEN method='Efectivo' AND amount<0 THEN -amount ELSE 0 END),0) cash_refunds,
+          COALESCE(SUM(CASE WHEN method='Nequi' AND amount<0 THEN -amount ELSE 0 END),0) nequi_refunds,
           COALESCE(SUM(CASE WHEN method='Efectivo' THEN amount ELSE 0 END),0) cash_payment_net
           FROM payments WHERE cash_id=?""",(cash_id,))
         moves=self.one(db,"""SELECT
@@ -226,8 +227,9 @@ class Store:
           COALESCE(SUM(amount),0) moves_net
           FROM cash_moves WHERE cash_id=?""",(cash_id,))
         last=self.one(db,'SELECT nequi_amount,decision,created FROM cash_nequi_reviews WHERE cash_id=? ORDER BY id DESC LIMIT 1',(cash_id,)) or {}
+        cash_sales_net=payments['cash_sales']-payments['cash_refunds']; nequi_sales_net=payments['nequi_sales']-payments['nequi_refunds']
         expected_without_opening=payments['cash_payment_net']+moves['moves_net']; expected_total=c['opening']+expected_without_opening
-        return {'sales_total':sales['sales_total'],'collected_sales_total':payments['cash_sales']+payments['nequi_sales'],'cash_sales':payments['cash_sales'],'nequi_sales':payments['nequi_sales'],'nequi_total':payments['nequi_total'],'credit_sales':sales['credit_sales'],'cash_collections':payments['cash_collections'],'nequi_collections':payments['nequi_collections'],'cash_refunds':payments['cash_refunds'],'adjustments_total':moves['adjustments_total'],'cash_moves_net':moves['moves_net'],'expected_total':expected_total,'expected_without_opening':expected_without_opening,'reviewed_nequi_amount':last.get('nequi_amount',0),'nequi_review_required':bool(payments['nequi_total']>last.get('nequi_amount',0))}
+        return {'sales_total':sales['sales_total'],'collected_sales_total':cash_sales_net+nequi_sales_net,'cash_sales':payments['cash_sales'],'cash_sales_net':cash_sales_net,'nequi_sales':payments['nequi_sales'],'nequi_sales_net':nequi_sales_net,'nequi_total':payments['nequi_total'],'credit_sales':sales['credit_sales'],'cash_collections':payments['cash_collections'],'nequi_collections':payments['nequi_collections'],'cash_refunds':payments['cash_refunds'],'nequi_refunds':payments['nequi_refunds'],'adjustments_total':moves['adjustments_total'],'cash_moves_net':moves['moves_net'],'expected_total':expected_total,'expected_without_opening':expected_without_opening,'reviewed_nequi_amount':last.get('nequi_amount',0),'nequi_review_required':bool(payments['nequi_total']>last.get('nequi_amount',0))}
     def ensure_receivables(self,db,b,customer_id=None,sale_id=None):
         filters=['s.business_id=?','s.customer_id IS NOT NULL','s.original_debt>0']; args=[b]
         if customer_id is not None: filters.append('s.customer_id=?'); args.append(customer_id)
@@ -489,7 +491,7 @@ class Store:
                 result['id']=db.execute('INSERT INTO quotes(business_id,customer_id,user_id,created,valid_until,lines,total,note) VALUES(?,?,?,?,?,?,?,?)',(b,cid,u['id'],now(),valid,json.dumps(lines),sum(l['total'] for l in lines),clean(d.get('note'),1000))).lastrowid; result['receipt']='quote'
             elif action=='sale':
                 request=clean(d.get('request_id')); require(len(request)>=16,'Identificador de venta inválido')
-                old=self.one(db,'SELECT id FROM sales WHERE business_id=? AND request_id=?',(b,request))
+                old=self.one(db,'SELECT id,number,created FROM sales WHERE business_id=? AND request_id=?',(b,request))
                 if old: return {**old,'receipt':'sale','ok':True}
                 c=self.cash(db,b); raw_lines=d.get('lines') or []; extras=d.get('unregistered_lines') or []; dairy_raw=d.get('dairy_lines') or []
                 require(raw_lines or extras or dairy_raw,'Agregue productos a la venta'); lines=self.lines(db,b,raw_lines) if raw_lines else []
@@ -547,7 +549,7 @@ class Store:
                     if dairy_part: db.execute('INSERT INTO dairy_payments(sale_id,method,amount,created) VALUES(?,?,?,?)',(sid,method,dairy_part,sale_time)); dairy_remaining-=dairy_part; val-=dairy_part
                     if val: db.execute('INSERT INTO payments(business_id,sale_id,cash_id,user_id,created,method,amount,kind,reference) VALUES(?,?,?,?,?,?,?,?,?)',(b,sid,c['id'],u['id'],sale_time,method,val,'Venta',ref))
                 if quote_id: db.execute('UPDATE quotes SET converted_sale=? WHERE id=?',(sid,quote_id))
-                result.update(id=sid,receipt='sale',change=change)
+                result.update(id=sid,number=number,created=sale_time,receipt='sale',change=change)
             elif action=='repay':
                 c=self.cash(db,b); sale=self.scoped(db,'sales',d['sale_id'],b); val=money(d['amount']); method=d['method']
                 request=clean(d.get('request_id')) or secrets.token_urlsafe(18)
@@ -678,18 +680,18 @@ class Store:
     def history(self,u,b,start,end):
         start=iso(start); end=iso(end); require(start<=end,'Rango de fechas inválido')
         with self.connect() as db:
-            sales=self.rows(db,"SELECT s.*,s.total+COALESCE(s.dairy_total,0) receipt_total,c.name customer,c.phone customer_phone,c.document customer_document,c.email customer_email,u.name operator,COALESCE((SELECT GROUP_CONCAT(method||': '||printf('%.2f',amount/100.0),' · ') FROM (SELECT method,SUM(amount) amount FROM (SELECT method,amount FROM payments WHERE sale_id=s.id AND amount>0 UNION ALL SELECT method,amount FROM dairy_payments WHERE sale_id=s.id AND amount>0) GROUP BY method)),'Fiado') payment_methods FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND (s.total>0 OR COALESCE(s.dairy_total,0)>0) AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY s.id DESC",(b,start,end))
+            sales=self.rows(db,"SELECT s.*,s.total+COALESCE(s.dairy_total,0) receipt_total,c.name customer,c.phone customer_phone,c.document customer_document,c.email customer_email,u.name operator,COALESCE((SELECT GROUP_CONCAT(method||': '||printf('%.2f',amount/100.0),' · ') FROM (SELECT method,SUM(amount) amount FROM (SELECT method,amount FROM payments WHERE sale_id=s.id AND amount>0 UNION ALL SELECT method,amount FROM dairy_payments WHERE sale_id=s.id AND amount>0) GROUP BY method)),'Fiado') payment_methods FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND (s.total>0 OR COALESCE(s.dairy_total,0)>0) AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY s.id DESC",(b,start,end))
             debts=self.rows(db,"SELECT s.*,c.name customer,c.phone,c.document FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.debt>0 AND s.status='active' ORDER BY s.due,s.id",(b,))
             if u['role']!='admin':
                 for s in sales+debts: s.pop('cost',None)
-            result={'sales':sales,'debts':debts,'credit_sales':self.rows(db,"SELECT s.id,s.number,s.created,s.customer_id,c.name customer,s.original_debt,s.debt,s.status FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.original_debt>0 AND s.status='active' AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY s.created DESC,s.id DESC",(b,start,end)),'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,'SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY l.id DESC',(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
+            result={'sales':sales,'debts':debts,'credit_sales':self.rows(db,"SELECT s.id,s.number,s.created,s.customer_id,c.name customer,s.original_debt,s.debt,s.status FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.original_debt>0 AND s.status='active' AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY s.created DESC,s.id DESC",(b,start,end)),'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,"SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY l.id DESC",(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
             if u['role']=='admin':
-                result['stock_moves']=self.rows(db,'SELECT m.*,p.name,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? ORDER BY m.id DESC',(b,start,end))
-                result['payments']=self.rows(db,'SELECT method,kind,SUM(amount) amount FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ? GROUP BY method,kind',(b,start,end))
-                result['sale_payments']=self.rows(db,'SELECT sale_id,method,amount,kind FROM payments WHERE business_id=? AND substr(created,1,10) BETWEEN ? AND ?',(b,start,end))
-                result['top']=self.rows(db,"SELECT l.product_id,l.name,l.unit,SUM(l.qty) qty,SUM(l.total) total,SUM(l.total-l.cost) margin FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' AND substr(s.created,1,10) BETWEEN ? AND ? GROUP BY l.product_id,l.name,l.unit ORDER BY total DESC",(b,start,end))
-                result['audit']=self.rows(db,'SELECT a.created,a.action,u.name operator,a.detail FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.business_id=? AND substr(a.created,1,10) BETWEEN ? AND ? ORDER BY a.id DESC LIMIT 500',(b,start,end))
-                result['cash_moves']=self.rows(db,'SELECT m.*,u.name operator FROM cash_moves m JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? ORDER BY m.id DESC',(b,start,end))
+                result['stock_moves']=self.rows(db,"SELECT m.*,p.name,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND date(m.created,'-5 hours') BETWEEN ? AND ? ORDER BY m.id DESC",(b,start,end))
+                result['payments']=self.rows(db,"SELECT method,kind,SUM(amount) amount FROM payments WHERE business_id=? AND date(created,'-5 hours') BETWEEN ? AND ? GROUP BY method,kind",(b,start,end))
+                result['sale_payments']=self.rows(db,"SELECT sale_id,method,amount,kind FROM payments WHERE business_id=? AND date(created,'-5 hours') BETWEEN ? AND ?",(b,start,end))
+                result['top']=self.rows(db,"SELECT l.product_id,l.name,l.unit,SUM(l.qty) qty,SUM(l.total) total,SUM(l.total-l.cost) margin FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' AND date(s.created,'-5 hours') BETWEEN ? AND ? GROUP BY l.product_id,l.name,l.unit ORDER BY total DESC",(b,start,end))
+                result['audit']=self.rows(db,"SELECT a.created,a.action,u.name operator,a.detail FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.business_id=? AND date(a.created,'-5 hours') BETWEEN ? AND ? ORDER BY a.id DESC LIMIT 500",(b,start,end))
+                result['cash_moves']=self.rows(db,"SELECT m.*,u.name operator FROM cash_moves m JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND date(m.created,'-5 hours') BETWEEN ? AND ? ORDER BY m.id DESC",(b,start,end))
                 result['users']=self.rows(db,'SELECT id,username,name,role,businesses,active FROM users')
                 result['finance_permissions']=self.rows(db,'SELECT * FROM finance_permissions ORDER BY user_id,business_id')
                 result['dairy_permissions']=self.rows(db,'SELECT * FROM dairy_permissions ORDER BY user_id')
@@ -807,7 +809,7 @@ class Store:
             cash_row=lambda label,value,classes='': '<p class="cash-row '+classes+'"><span>'+e(label)+'</span><strong>'+value+'</strong></p>'
             rows.append('<hr>'+cash_row('RESUMEN DE VENTAS','','cash-heading'))
             rows.append(cash_row('TOTAL VENTAS',fmt(d['collected_sales_total']),'cash-total'))
-            rows.append(cash_row('Ventas en efectivo',fmt(d['cash_sales']))+cash_row('Ventas por Nequi',fmt(d['nequi_sales']))+cash_row('Ventas fiadas',fmt(d['credit_sales'])))
+            rows.append(cash_row('Ventas netas en efectivo',fmt(d['cash_sales_net']))+cash_row('Ventas netas por Nequi',fmt(d['nequi_sales_net']))+cash_row('Ventas fiadas',fmt(d['credit_sales'])))
             if d['cash_collections'] or d['nequi_collections']:
                 rows.append(cash_row('ABONOS RECIBIDOS','','cash-heading'))
                 rows.append(cash_row('Abonos en efectivo',fmt(d['cash_collections']))+cash_row('Abonos por Nequi',fmt(d['nequi_collections'])))
@@ -867,7 +869,7 @@ class Store:
             cash_fmt=lambda value:f'$ {value/100:,.0f}'
             signed=lambda value:('+ ' if value>=0 else '- ')+cash_fmt(abs(value))
             cash_lines=lambda label,value: [row(line,value if index==len(textwrap.wrap(str(label),label_width) or [''])-1 else '') for index,line in enumerate(textwrap.wrap(str(label),label_width) or [''])]
-            out += ['RESUMEN DE VENTAS',*cash_lines('TOTAL VENTAS',cash_fmt(d['collected_sales_total'])),*cash_lines('Ventas en efectivo',cash_fmt(d['cash_sales'])),*cash_lines('Ventas por Nequi',cash_fmt(d['nequi_sales'])),*cash_lines('Ventas fiadas',cash_fmt(d['credit_sales']))]
+            out += ['RESUMEN DE VENTAS',*cash_lines('TOTAL VENTAS',cash_fmt(d['collected_sales_total'])),*cash_lines('Ventas netas efectivo',cash_fmt(d['cash_sales_net'])),*cash_lines('Ventas netas Nequi',cash_fmt(d['nequi_sales_net'])),*cash_lines('Ventas fiadas',cash_fmt(d['credit_sales']))]
             if d['cash_collections'] or d['nequi_collections']:
                 out += ['ABONOS RECIBIDOS',*cash_lines('Abonos en efectivo',cash_fmt(d['cash_collections'])),*cash_lines('Abonos por Nequi',cash_fmt(d['nequi_collections']))]
             out += ['CUADRE DE EFECTIVO',*cash_lines('Efectivo de ventas','+ '+cash_fmt(d['cash_sales'])),*cash_lines('Abonos en efectivo','+ '+cash_fmt(d['cash_collections'])),*cash_lines('Devoluciones en efectivo','- '+cash_fmt(d['cash_refunds']))]
@@ -928,7 +930,7 @@ class Handler(BaseHTTPRequestHandler):
             else: d={}
             if path=='/api/status' and not post:
                 with self.store.connect() as db: setup=not bool(db.execute('SELECT 1 FROM users WHERE active=1').fetchone())
-                return self.respond(200,{'setup':setup,'version':'3.3.8'})
+                return self.respond(200,{'setup':setup,'version':'3.3.9'})
             if path=='/api/setup' and post: return self.respond(200,self.store.setup(d))
             if path=='/api/login' and post:
                 key=self.client_address[0]; attempts=[x for x in self.attempts.get(key,[]) if x>time.time()-300]; require(len(attempts)<10,'Espere cinco minutos antes de intentar nuevamente'); attempts.append(time.time()); self.attempts[key]=attempts

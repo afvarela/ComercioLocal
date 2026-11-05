@@ -131,6 +131,7 @@ dialog{border-top:5px solid var(--action)}.dialog-header{margin-bottom:19px}.clo
   .dispatch-cards article{font-size:clamp(14px,.8vw,16px);padding:clamp(15px,1.2vh,20px) clamp(18px,1.15vw,24px)}
 }
 .letter-invoice-dialog{width:min(1180px,97vw);padding:20px}.letter-invoice-actions{margin:12px 0 15px}.invoice-download{display:inline-flex;align-items:center;border:1px solid var(--action);background:var(--action);color:var(--action-ink);border-radius:8px;padding:10px 15px;font-weight:700;text-decoration:none}.letter-invoice-preview{display:block;width:100%;height:min(72vh,900px);border:1px solid var(--line);border-radius:8px;background:#e8e7e2}@media(max-width:720px){.letter-invoice-dialog{padding:14px}.letter-invoice-actions>*{width:100%;justify-content:center;text-align:center}.letter-invoice-preview{height:65vh}}
+.account-statement-dialog{width:min(820px,96vw)}.account-statement-actions{margin:0 0 14px}.account-statement-preview{display:block;height:min(68vh,850px);background:#e8e7e2;border-radius:8px}
 
 /* Cobro con teclado físico y notificaciones no bloqueantes del POS. */
 .checkout-dialog .payment-list{grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}

@@ -107,3 +107,12 @@ test("ventas y recibos incluye operaciones con lácteos sin sumarlas al reporte 
   assert.match(endpoint, /s\.total>0 OR COALESCE\(s\.dairy_total,0\)>0/);
   assert.match(page, /receipt_total \?\? s\.total/);
 });
+
+test("las escrituras D1 concurrentes abortan y reintentan sin compartir identificadores", () => {
+  const store = read("cloudflare/store.mjs");
+  const migration = read("cloudflare/migrations/0021_transaction_revision_guard.sql");
+  assert.match(store, /version=CASE WHEN version=\? THEN version\+1 ELSE -1 END/);
+  assert.match(store, /CHECK constraint failed\.\*version/);
+  assert.match(migration, /version INTEGER NOT NULL CHECK\(version>=0\)/);
+  assert.match(migration, /MAX\(version,0\)/);
+});

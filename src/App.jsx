@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
-import { api, downloadInvoicePdf, pendingSales, syncPendingSales, syncProductCatalog, projectOfflineState } from "./lib/api.js";
-import { printReceipt, printOfflineSale, printAccountStatement } from "./lib/printer.js";
+import { api, downloadInvoicePdf, pendingSales, savedLocalSale, syncPendingSales, syncProductCatalog, projectOfflineState } from "./lib/api.js";
+import { printReceipt, printOfflineSale } from "./lib/printer.js";
+import AccountStatement from "./components/AccountStatement.jsx";
 import {
   cop,
   cartTotal,
@@ -712,8 +713,7 @@ export default function App() {
           }
           if (!statement.sales?.length) throw Error("El cliente no tiene compras fiadas para imprimir");
           const businessName = state.businesses.find((item) => item.id === business)?.name || "Comercio Local";
-          await printAccountStatement(businessName, statement);
-          toast("Estado de cuenta enviado a la impresora");
+          setModal({ type: "account_statement", businessName, statement, key: uid() });
           break;
         }
         case "save_quote":
@@ -816,8 +816,8 @@ export default function App() {
           setView("dispatches");
           break;
         case "print_offline_sale": {
-          const pendingSale = pendingSales().find((item) => item.business === business && item.action === "sale" && item.requestId === id);
-          if (!pendingSale) throw Error("La venta local ya no está pendiente o ya fue sincronizada");
+          const pendingSale = savedLocalSale(business, id);
+          if (!pendingSale) throw Error("La copia local de esta venta ya no está disponible");
           const data = pendingSale.data.data;
           const meta = data._offline || {};
           await printOfflineSale({
@@ -1025,6 +1025,8 @@ export default function App() {
           onClose={close}
           onWhatsApp={(id) => action("invoice_whatsapp", id)}
         />
+      ) : modal?.type === "account_statement" ? (
+        <AccountStatement key={modal.key} businessName={modal.businessName} statement={modal.statement} onClose={close} />
       ) : (
         modal && (
           <OperationForm
