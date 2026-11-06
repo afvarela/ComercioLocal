@@ -26,6 +26,23 @@ class FinanceTests(unittest.TestCase):
         invoice=finance_state(self.store,self.user,1)['invoices'][0]; self.assertEqual(invoice['status'],'paid')
         with self.assertRaises(ValueError): self.cmd('invoice_pay',{'invoice_id':inv,'account_id':103,'amount':1,'date':today()})
 
+    def test_invoice_payment_does_not_require_account_balance(self):
+        before=next(x for x in finance_state(self.store,self.user,1)['accounts'] if x['name']=='Nequi')['balance']
+        inv=self.cmd('invoice_create',{'invoice_date':today(),'description':'Factura independiente','total':2500000,'payments':[{'account_id':102,'amount':2500000}]})['id']
+        state=finance_state(self.store,self.user,1)
+        invoice=next(x for x in state['invoices'] if x['id']==inv)
+        nequi=next(x for x in state['accounts'] if x['name']=='Nequi')
+        self.assertEqual(invoice['status'],'paid')
+        self.assertEqual(nequi['balance'],before-250000000)
+        self.assertLess(nequi['balance'],0)
+
+    def test_profit_values_are_independent_from_profit_and_sales(self):
+        profit=self.cmd('profit_create',{'period':'2026-11','profit':1000000,'date':today(),'allocations':[{'account_id':102,'amount':125000}]})['id']
+        self.cmd('profit_fund',{'profit_id':profit,'date':today(),'allocations':[{'account_id':102,'amount':25000},{'account_id':103,'amount':50000}]})
+        item=next(x for x in finance_state(self.store,self.user,1)['profits'] if x['id']==profit)
+        self.assertEqual(item['profit'],100000000)
+        self.assertEqual(item['funded'],20000000)
+
     def test_payroll_profit_distribution_and_reinvestment(self):
         employee=self.cmd('employee_create',{'name':'Ana','document':'1','salary':1300000,'started':today()})['id']
         payroll=self.cmd('payroll_create',{'employee_id':employee,'period':'2026-09','days_worked':30,'base_salary':1300000,'bonuses':100000,'deductions':50000})['id']

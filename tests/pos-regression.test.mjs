@@ -65,6 +65,21 @@ test("estado de cuenta muestra facturas y productos sin repetir fiado ni saldo p
   assert.doesNotMatch(html, /Saldo de la compra/);
 });
 
+test("contabilidad registra facturas y utilidades sin saldos del POS", () => {
+  const local = fs.readFileSync(new URL("../finance.py", import.meta.url), "utf8");
+  const cloud = fs.readFileSync(new URL("../cloudflare/finance.mjs", import.meta.url), "utf8");
+  const page = fs.readFileSync(new URL("../src/pages/Accounting.jsx", import.meta.url), "utf8");
+  assert.doesNotMatch(local, /new<0/);
+  assert.doesNotMatch(cloud, /balance>=0/);
+  assert.doesNotMatch(local, /sum\(allocations\.values\(\)\)!=profit/);
+  assert.doesNotMatch(cloud, /allocations\.reduce\(\(n,x\)=>n\+x\.amount,0\)===profit/);
+  assert.doesNotMatch(local, /\bFROM sales\b/i);
+  assert.doesNotMatch(cloud, /\bFROM sales\b/i);
+  assert.match(page, /independientes de las ventas/);
+  assert.match(page, /no validan el saldo disponible/);
+  assert.match(page, /no tienen que coincidir entre sí/);
+});
+
 test("cierre separa base efectivo Nequi fiados y salida real", () => {
   const form = fs.readFileSync(new URL("../src/components/OperationForm.jsx", import.meta.url), "utf8");
   const page = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");

@@ -27,7 +27,7 @@ def balance(db,business,account):
     return item
 def movement(db,user,business,account,amount,direction,kind,concept,effective,source_type=None,source_id=None,request_id=None):
     current=balance(db,business,int(account)); new=current['balance']+direction*amount
-    if amount<=0 or new<0: raise ValueError('La cuenta no tiene saldo suficiente')
+    if amount<=0: raise ValueError('El valor del movimiento debe ser mayor que cero')
     rid=clean(request_id) or secrets.token_urlsafe(18)
     cursor=db.execute('INSERT INTO finance_movements(business_id,account_id,created,effective_date,kind,concept,source_type,source_id,direction,amount,balance_after,user_id,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(business,int(account),now(),valid_date(effective),kind,clean(concept),source_type,source_id,direction,amount,new,user['id'],rid))
     return cursor.lastrowid
@@ -89,7 +89,6 @@ def finance_command(store,user,business,action,data):
             allocations={}
             for item in data.get('allocations',[]):
                 account=int(item['account_id']); allocations[account]=allocations.get(account,0)+cents(item.get('amount'))
-            if sum(allocations.values())!=profit: raise ValueError('La suma de Efectivo, Nequi y Bancolombia debe ser igual a la utilidad')
             result['id']=db.execute('INSERT INTO finance_profits(business_id,period,profit,distribution_pct,reinvestment_pct,distribution_fund,reinvestment,available_distribution,remaining_profit,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(business,data['period'],profit,settings['distribution_pct'],settings['reinvestment_pct'],fund,reinvestment,fund-reinvestment,profit-fund,clean(data.get('note'),1000),user['id'],now())).lastrowid
             for account,value in allocations.items():
                 if not value: continue
@@ -101,11 +100,10 @@ def finance_command(store,user,business,action,data):
             allocations={}
             for item in data.get('allocations',[]):
                 account=int(item['account_id']); allocations[account]=allocations.get(account,0)+cents(item.get('amount'))
-            if sum(allocations.values())!=profit['profit']-profit['funded']: raise ValueError('La suma por cuentas debe ser igual al saldo de la utilidad todavía no asignado')
             for account,value in allocations.items():
                 if not value: continue
                 mrid=f'{rid}:{account}'; mid=movement(db,user,business,account,value,1,'Utilidad registrada',f'Utilidad de {profit["period"]}',data.get('date') or date.today().isoformat(),'profit',profit['id'],mrid)
-                db.execute('INSERT INTO finance_profit_funding(business_id,profit_id,account_id,amount,movement_id) VALUES(?,?,?,?,?)',(business,profit['id'],account,value,mid))
+                db.execute('INSERT INTO finance_profit_funding(business_id,profit_id,account_id,amount,movement_id) VALUES(?,?,?,?,?) ON CONFLICT(profit_id,account_id) DO UPDATE SET amount=amount+excluded.amount,movement_id=excluded.movement_id',(business,profit['id'],account,value,mid))
         elif action=='beneficiary_create':
             if not clean(data.get('name')): raise ValueError('Escriba el beneficiario')
             result['id']=db.execute('INSERT INTO finance_beneficiaries(business_id,name,document) VALUES(?,?,?)',(business,clean(data['name']),clean(data.get('document')))).lastrowid
