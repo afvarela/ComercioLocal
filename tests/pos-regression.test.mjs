@@ -65,19 +65,52 @@ test("estado de cuenta muestra facturas y productos sin repetir fiado ni saldo p
   assert.doesNotMatch(html, /Saldo de la compra/);
 });
 
-test("contabilidad registra facturas y utilidades sin saldos del POS", () => {
+test("estado de cuenta muestra el abono parcial y el saldo de la factura pendiente", () => {
+  const html = accountStatementHtml("Tienda El Descanso", {
+    customer: { name: "Cliente parcial", document: "321" },
+    sales: [{ number: 22, created: "2026-11-09T12:00:00Z", paid_amount: 250000, debt: 750000, lines: [] }],
+    total_credit: 1000000, payments: 250000, returns: 0, balance: 750000,
+  });
+  assert.match(html, /Abono aplicado/);
+  assert.match(html, /Saldo pendiente/);
+  assert.match(html, /Solo se muestran facturas con saldo pendiente/);
+});
+
+test("POS permite crear cobrar reducir y eliminar reservas de lácteos", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const pos = fs.readFileSync(new URL("../src/pages/PointOfSale.jsx", import.meta.url), "utf8");
+  const checkout = fs.readFileSync(new URL("../src/components/Checkout.jsx", import.meta.url), "utf8");
+  const migration = fs.readFileSync(new URL("../cloudflare/migrations/0024_dairy_reservations.sql", import.meta.url), "utf8");
+  assert.match(pos, /Reservas de lácteos/);
+  assert.match(pos, /Reservas · Leche:/);
+  assert.match(pos, /reservationsOpen/);
+  assert.match(pos, /Crear nueva reserva/);
+  assert.match(pos, /dairy_reservation_pay/);
+  assert.match(pos, /dairy_reservation_reduce/);
+  assert.match(pos, /dairy_reservation_delete/);
+  assert.match(app, /reservation_id/);
+  assert.match(checkout, /reservation_id/);
+  assert.match(migration, /dairy_reservations/);
+});
+
+test("Banco recibe cierres y las facturas permiten edición y pagos divididos", () => {
   const local = fs.readFileSync(new URL("../finance.py", import.meta.url), "utf8");
   const cloud = fs.readFileSync(new URL("../cloudflare/finance.mjs", import.meta.url), "utf8");
   const page = fs.readFileSync(new URL("../src/pages/Accounting.jsx", import.meta.url), "utf8");
+  const migration = fs.readFileSync(new URL("../cloudflare/migrations/0022_finance_bank.sql", import.meta.url), "utf8");
   assert.doesNotMatch(local, /new<0/);
   assert.doesNotMatch(cloud, /balance>=0/);
   assert.doesNotMatch(local, /sum\(allocations\.values\(\)\)!=profit/);
   assert.doesNotMatch(cloud, /allocations\.reduce\(\(n,x\)=>n\+x\.amount,0\)===profit/);
-  assert.doesNotMatch(local, /\bFROM sales\b/i);
-  assert.doesNotMatch(cloud, /\bFROM sales\b/i);
-  assert.match(page, /independientes de las ventas/);
-  assert.match(page, /no validan el saldo disponible/);
-  assert.match(page, /no tienen que coincidir entre sí/);
+  assert.match(local, /sync_bank_closures/);
+  assert.match(cloud, /syncBankClosures/);
+  assert.match(local, /action=='invoice_edit'/);
+  assert.match(cloud, /action==='invoice_edit'/);
+  assert.match(page, /\["bank","Banco"\]/);
+  assert.match(page, /Ventas trasladadas después del cierre/);
+  assert.match(page, /Puedes dividir el valor entre Efectivo, Nequi y Bancolombia/);
+  assert.match(page, /type:"invoice_edit"/);
+  assert.match(migration, /UNIQUE\(business_id,cash_id\)/);
 });
 
 test("cierre separa base efectivo Nequi fiados y salida real", () => {
@@ -87,7 +120,7 @@ test("cierre separa base efectivo Nequi fiados y salida real", () => {
   assert.match(form, /Total a contar en caja/);
   assert.match(form, /pago en efectivo al proveedor de quesos/);
   assert.match(page, /Efectivo del turno \(sin base\)/);
-  assert.match(page, /Total ventas \(efectivo \+ Nequi\)/);
+  assert.match(page, /Total recibido \(ventas \+ abonos\)/);
   assert.match(page, /c\.collected_sales_total/);
   assert.match(page, /Ajuste de efectivo y Nequi/);
   assert.match(style, /movement-filter-bar/);
@@ -234,4 +267,39 @@ test("las ventas locales conservan detalle para reimprimir sin servidor", () => 
   assert.match(pages, /Reimprimir recibo local/);
   assert.match(printer, /printOfflineSale/);
   assert.doesNotMatch(printer.match(/export async function printOfflineSale[\s\S]*$/)?.[0] || "", /receipt\.txt/);
+});
+
+test("movimientos combina filtros y muestra trazabilidad completa", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const pages = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  const ui = fs.readFileSync(new URL("../src/components/UI.jsx", import.meta.url), "utf8");
+  const local = fs.readFileSync(new URL("../server.py", import.meta.url), "utf8");
+  const cloud = fs.readFileSync(new URL("../cloudflare/read.mjs", import.meta.url), "utf8");
+  assert.match(pages, /movement\.sku/);
+  assert.match(pages, /movement\.barcode/);
+  assert.match(pages, /Existencia anterior/);
+  assert.match(pages, /Cantidad \(\+\/\-\)/);
+  assert.match(pages, /Existencia posterior/);
+  assert.match(ui, /a > b/);
+  assert.match(local, /p\.sku,p\.barcode/);
+  assert.match(cloud, /p\.sku,p\.barcode/);
+  assert.match(cloud, /m\.created>=\? AND m\.created<\?/);
+  assert.match(app, /view === "inventory"/);
+  assert.match(app, /new URLSearchParams\(\{ start: a, end: z, limit: "500" \}\)/);
+  assert.match(app, /params\.set\("q", filters\.search\.trim\(\)\)/);
+  assert.match(app, /params\.set\("type", filters\.type\)/);
+  const dateHandler = app.match(/async function dates\(a, z, filters = \{\}\) \{[\s\S]*?\n  \}/)?.[0] || "";
+  assert.doesNotMatch(dateHandler, /refresh\(/);
+  assert.match(pages, /loadMovements\(start, end, moveSearch, moveType\)/);
+});
+
+test("existencias por lote se actualiza desde una ruta independiente", () => {
+  const pages = fs.readFileSync(new URL("../src/pages/AdminPages.jsx", import.meta.url), "utf8");
+  const worker = fs.readFileSync(new URL("../cloudflare/worker.mjs", import.meta.url), "utf8");
+  const read = fs.readFileSync(new URL("../cloudflare/read.mjs", import.meta.url), "utf8");
+  assert.match(pages, /api\(business, "\/api\/inventory-lots"\)/);
+  assert.match(pages, /rows=\{lots/);
+  assert.match(pages, /Se conserva la última información disponible/);
+  assert.match(worker, /path==='\/api\/inventory-lots'/);
+  assert.match(read, /export async function inventoryLots/);
 });

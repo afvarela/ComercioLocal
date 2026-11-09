@@ -32,21 +32,55 @@ def movement(db,user,business,account,amount,direction,kind,concept,effective,so
     cursor=db.execute('INSERT INTO finance_movements(business_id,account_id,created,effective_date,kind,concept,source_type,source_id,direction,amount,balance_after,user_id,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(business,int(account),now(),valid_date(effective),kind,clean(concept),source_type,source_id,direction,amount,new,user['id'],rid))
     return cursor.lastrowid
 
+BANK_METHODS=(('Efectivo','efectivo'),('Nequi','nequi'),('Bancolombia','bancolombia'))
+def sync_bank_closures(db,business):
+    """Postea una sola vez las ventas netas de cada caja cerrada al banco contable."""
+    pending=rows(db,"""SELECT c.id cash_id,c.closed closed_at,COALESCE(c.closed_by,c.user_id) posted_by,
+        COALESCE(SUM(CASE WHEN p.method='Efectivo' AND p.sale_id IS NOT NULL AND p.kind!='Abono' THEN p.amount ELSE 0 END),0) efectivo,
+        COALESCE(SUM(CASE WHEN p.method='Nequi' AND p.sale_id IS NOT NULL AND p.kind!='Abono' THEN p.amount ELSE 0 END),0) nequi,
+        COALESCE(SUM(CASE WHEN p.method='Bancolombia' AND p.sale_id IS NOT NULL AND p.kind!='Abono' THEN p.amount ELSE 0 END),0) bancolombia
+        FROM cash_sessions c LEFT JOIN payments p ON p.cash_id=c.id
+        WHERE c.business_id=? AND c.closed IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM finance_bank_closures x WHERE x.business_id=c.business_id AND x.cash_id=c.id)
+        GROUP BY c.id,c.closed,c.closed_by,c.user_id ORDER BY c.id""",(business,))
+    if not pending: return
+    accounts={item['name']:item for item in rows(db,'SELECT * FROM finance_accounts WHERE business_id=? AND active=1',(business,))}
+    for close in pending:
+        total=sum(close[column] for _,column in BANK_METHODS)
+        db.execute('INSERT INTO finance_bank_closures(business_id,cash_id,closed_at,efectivo,nequi,bancolombia,total,posted_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(business,close['cash_id'],close['closed_at'],close['efectivo'],close['nequi'],close['bancolombia'],total,close['posted_by'],now()))
+        effective=str(close['closed_at'])[:10]
+        for method,column in BANK_METHODS:
+            signed=int(close[column] or 0)
+            if not signed or method not in accounts: continue
+            direction=1 if signed>0 else -1; value=abs(signed); account=accounts[method]
+            movement(db,{'id':close['posted_by']},business,account['id'],value,direction,'Ventas de caja cerrada',f'{method} · cierre de caja #{close["cash_id"]}',effective,'cash_close',close['cash_id'],f'bank-close:{close["cash_id"]}:{account["id"]}')
+
 def finance_state(store,user,business,start='2000-01-01',end='2999-12-31'):
     with store.connect() as db:
         permission(db,user,business)
+        sync_bank_closures(db,business)
         accounts=rows(db,"SELECT a.*,a.opening_balance+COALESCE((SELECT SUM(direction*amount) FROM finance_movements WHERE account_id=a.id AND status='confirmed'),0) balance FROM finance_accounts a WHERE business_id=? AND active=1 ORDER BY id",(business,))
         invoices=rows(db,"SELECT i.*,COALESCE((SELECT SUM(amount) FROM finance_invoice_payments WHERE invoice_id=i.id AND status='confirmed'),0) paid FROM finance_invoices i WHERE business_id=? ORDER BY invoice_date DESC,id DESC",(business,))
+        invoice_payments=rows(db,"SELECT p.invoice_id,p.account_id,p.amount,p.paid_at,a.name account FROM finance_invoice_payments p JOIN finance_accounts a ON a.id=p.account_id WHERE p.business_id=? AND p.status='confirmed' ORDER BY p.id",(business,))
+        for invoice in invoices: invoice['payments']=[item for item in invoice_payments if item['invoice_id']==invoice['id']]
         employees=rows(db,'SELECT * FROM finance_employees WHERE business_id=? ORDER BY active DESC,name',(business,))
         payrolls=rows(db,"SELECT p.*,e.name employee,COALESCE((SELECT SUM(amount) FROM finance_payroll_payments WHERE payroll_id=p.id AND status='confirmed'),0) paid FROM finance_payrolls p JOIN finance_employees e ON e.id=p.employee_id WHERE p.business_id=? ORDER BY p.period DESC,p.id DESC",(business,))
         profits=rows(db,"SELECT p.*,COALESCE((SELECT SUM(amount) FROM finance_profit_payouts WHERE profit_id=p.id AND status='confirmed'),0) distributed,COALESCE((SELECT SUM(amount) FROM finance_profit_funding WHERE profit_id=p.id),0) funded FROM finance_profits p WHERE p.business_id=? ORDER BY period DESC",(business,))
-        moves=rows(db,'SELECT m.*,a.name account,u.name operator FROM finance_movements m JOIN finance_accounts a ON a.id=m.account_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND m.effective_date BETWEEN ? AND ? ORDER BY m.effective_date DESC,m.id DESC LIMIT 1000',(business,valid_date(start),valid_date(end)))
+        moves=rows(db,"""SELECT m.*,a.name account,u.name operator,
+            a.opening_balance+SUM(m.direction*m.amount) OVER(PARTITION BY m.account_id ORDER BY m.effective_date,m.id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) balance_after
+            FROM finance_movements m JOIN finance_accounts a ON a.id=m.account_id JOIN users u ON u.id=m.user_id
+            WHERE m.business_id=? AND m.status='confirmed' AND m.effective_date BETWEEN ? AND ? ORDER BY m.effective_date DESC,m.id DESC LIMIT 1000""",(business,valid_date(start),valid_date(end)))
+        bank_closures=rows(db,'SELECT * FROM finance_bank_closures WHERE business_id=? ORDER BY closed_at DESC,id DESC LIMIT 200',(business,))
+        bank_sales=one(db,'SELECT COALESCE(SUM(efectivo),0) efectivo,COALESCE(SUM(nequi),0) nequi,COALESCE(SUM(bancolombia),0) bancolombia FROM finance_bank_closures WHERE business_id=?',(business,))
+        bank_spent={item['account']:item['amount'] for item in rows(db,"SELECT a.name account,COALESCE(SUM(p.amount),0) amount FROM finance_accounts a LEFT JOIN finance_invoice_payments p ON p.account_id=a.id AND p.business_id=? AND p.status='confirmed' WHERE a.business_id=? AND a.name IN ('Efectivo','Nequi','Bancolombia') GROUP BY a.id,a.name",(business,business))}
+        bank={method:{'sales':bank_sales[column],'spent':bank_spent.get(method,0),'balance':bank_sales[column]-bank_spent.get(method,0)} for method,column in BANK_METHODS}
+        bank['total']=sum(item['balance'] for item in bank.values())
         used=one(db,"SELECT COALESCE(SUM(amount),0) n FROM finance_reinvestment_uses WHERE business_id=? AND status='confirmed'",(business,))['n']; accrued=sum(x['reinvestment'] for x in profits)
         month=date.today().isoformat()[:7]; monthly=[x for x in moves if x['effective_date'].startswith(month)]
-        return {'permission':one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(user['id'],business)),'settings':one(db,'SELECT * FROM finance_settings WHERE business_id=?',(business,)),'accounts':accounts,'invoices':invoices,'employees':employees,'payrolls':payrolls,'profits':profits,'beneficiaries':rows(db,'SELECT * FROM finance_beneficiaries WHERE business_id=? AND active=1 ORDER BY name',(business,)),'movements':moves,'reconciliations':rows(db,'SELECT r.*,a.name account FROM finance_reconciliations r JOIN finance_accounts a ON a.id=r.account_id WHERE r.business_id=? ORDER BY r.id DESC LIMIT 100',(business,)),'summary':{'total':sum(x['balance'] for x in accounts),'invoice_pending':sum(max(0,x['total']-x['paid']) for x in invoices),'payroll_pending':sum(max(0,x['net_total']-x['paid']) for x in payrolls),'reinvestment_accrued':accrued,'reinvestment_used':used,'reinvestment_available':accrued-used,'distribution_pending':sum(max(0,x['available_distribution']-x['distributed']) for x in profits),'income':sum(x['amount'] for x in monthly if x['direction']==1),'expense':sum(x['amount'] for x in monthly if x['direction']==-1)}}
+        return {'permission':one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(user['id'],business)),'settings':one(db,'SELECT * FROM finance_settings WHERE business_id=?',(business,)),'accounts':accounts,'invoices':invoices,'bank':bank,'bank_closures':bank_closures,'employees':employees,'payrolls':payrolls,'profits':profits,'beneficiaries':rows(db,'SELECT * FROM finance_beneficiaries WHERE business_id=? AND active=1 ORDER BY name',(business,)),'movements':moves,'reconciliations':rows(db,'SELECT r.*,a.name account FROM finance_reconciliations r JOIN finance_accounts a ON a.id=r.account_id WHERE r.business_id=? ORDER BY r.id DESC LIMIT 100',(business,)),'summary':{'total':sum(x['balance'] for x in accounts),'invoice_pending':sum(max(0,x['total']-x['paid']) for x in invoices),'payroll_pending':sum(max(0,x['net_total']-x['paid']) for x in payrolls),'reinvestment_accrued':accrued,'reinvestment_used':used,'reinvestment_available':accrued-used,'distribution_pending':sum(max(0,x['available_distribution']-x['distributed']) for x in profits),'income':sum(x['amount'] for x in monthly if x['direction']==1),'expense':sum(x['amount'] for x in monthly if x['direction']==-1)}}
 
 def finance_command(store,user,business,action,data):
-    required='configure' if action in ('settings','account_adjust','reconcile') else 'authorize' if action in ('invoice_pay','payroll_pay','profit_payout','transfer','reinvestment_use') else 'create'
+    required='configure' if action in ('settings','account_adjust','reconcile') else 'edit' if action=='invoice_edit' else 'authorize' if action in ('invoice_pay','payroll_pay','profit_payout','transfer','reinvestment_use') else 'create'
     with store.connect() as db:
         permission(db,user,business,required); result={'ok':True}; rid=clean(data.get('request_id')) or secrets.token_urlsafe(18)
         if action=='settings':
@@ -67,11 +101,37 @@ def finance_command(store,user,business,action,data):
                 mrid=f'{rid}:{account}'; mid=movement(db,user,business,account,amount,-1,'Pago de factura',data['description'],data['invoice_date'],'invoice',invoice,mrid)
                 db.execute('INSERT INTO finance_invoice_payments(business_id,invoice_id,account_id,amount,paid_at,user_id,movement_id,request_id) VALUES(?,?,?,?,?,?,?,?)',(business,invoice,account,amount,valid_date(data['invoice_date']),user['id'],mid,mrid))
             result['id']=invoice
+        elif action=='invoice_edit':
+            invoice=one(db,'SELECT * FROM finance_invoices WHERE id=? AND business_id=?',(int(data.get('invoice_id') or 0),business)); total=cents(data['total']); payments={}
+            if not invoice: raise ValueError('Factura no encontrada')
+            for item in data.get('payments',[]):
+                account=int(item['account_id']); payments[account]=payments.get(account,0)+cents(item.get('amount'))
+            paid=sum(payments.values())
+            if not clean(data.get('description')) or total<=0 or paid>total: raise ValueError('Revise descripción, total y pagos')
+            old=rows(db,"SELECT * FROM finance_invoice_payments WHERE invoice_id=? AND status='confirmed'",(invoice['id'],))
+            if old:
+                ids=[item['movement_id'] for item in old]; db.execute(f"UPDATE finance_movements SET status='void' WHERE id IN ({','.join('?' for _ in ids)})",ids)
+                db.execute("UPDATE finance_invoice_payments SET status='void' WHERE invoice_id=? AND status='confirmed'",(invoice['id'],))
+            status='paid' if paid==total else 'partial' if paid else 'pending'
+            attachment=invoice['attachment'] if 'attachment' not in data else clean(data.get('attachment'),500)
+            db.execute('UPDATE finance_invoices SET number=?,invoice_date=?,description=?,total=?,tax=?,supplier=?,supplier_document=?,category=?,due_date=?,note=?,attachment=?,status=? WHERE id=? AND business_id=?',(clean(data.get('number')) or invoice['number'],valid_date(data['invoice_date']),clean(data['description']),total,cents(data.get('tax',invoice['tax']/100)),clean(data.get('supplier')),clean(data.get('supplier_document')),clean(data.get('category')),valid_date(data.get('due_date'),True),clean(data.get('note'),1000),attachment,status,invoice['id'],business))
+            for account,amount in payments.items():
+                if not amount: continue
+                mrid=f'{rid}:{account}'; mid=movement(db,user,business,account,amount,-1,'Pago de factura editada',data['description'],data['invoice_date'],'invoice',invoice['id'],mrid)
+                db.execute('INSERT INTO finance_invoice_payments(business_id,invoice_id,account_id,amount,paid_at,user_id,movement_id,request_id) VALUES(?,?,?,?,?,?,?,?)',(business,invoice['id'],account,amount,valid_date(data['invoice_date']),user['id'],mid,mrid))
+            result['id']=invoice['id']
         elif action=='invoice_pay':
-            inv=one(db,"SELECT i.*,COALESCE((SELECT SUM(amount) FROM finance_invoice_payments WHERE invoice_id=i.id AND status='confirmed'),0) paid FROM finance_invoices i WHERE id=? AND business_id=?",(int(data['invoice_id']),business)); amount=cents(data['amount'])
+            inv=one(db,"SELECT i.*,COALESCE((SELECT SUM(amount) FROM finance_invoice_payments WHERE invoice_id=i.id AND status='confirmed'),0) paid FROM finance_invoices i WHERE id=? AND business_id=?",(int(data['invoice_id']),business)); payments={}
+            for item in data.get('payments',[]):
+                account=int(item['account_id']); payments[account]=payments.get(account,0)+cents(item.get('amount'))
+            if not payments and data.get('account_id'): payments[int(data['account_id'])]=cents(data.get('amount'))
+            amount=sum(payments.values())
             if not inv or amount<=0 or amount>inv['total']-inv['paid']: raise ValueError('El abono supera el saldo')
-            mid=movement(db,user,business,data['account_id'],amount,-1,'Abono a factura',inv['description'],data['date'],'invoice',inv['id'],rid)
-            db.execute('INSERT INTO finance_invoice_payments(business_id,invoice_id,account_id,amount,paid_at,user_id,movement_id,request_id) VALUES(?,?,?,?,?,?,?,?)',(business,inv['id'],int(data['account_id']),amount,valid_date(data['date']),user['id'],mid,rid)); db.execute('UPDATE finance_invoices SET status=? WHERE id=?',('paid' if amount==inv['total']-inv['paid'] else 'partial',inv['id']))
+            for account,value in payments.items():
+                if not value: continue
+                mrid=f'{rid}:{account}'; mid=movement(db,user,business,account,value,-1,'Abono a factura',inv['description'],data['date'],'invoice',inv['id'],mrid)
+                db.execute('INSERT INTO finance_invoice_payments(business_id,invoice_id,account_id,amount,paid_at,user_id,movement_id,request_id) VALUES(?,?,?,?,?,?,?,?)',(business,inv['id'],account,value,valid_date(data['date']),user['id'],mid,mrid))
+            db.execute('UPDATE finance_invoices SET status=? WHERE id=?',('paid' if amount==inv['total']-inv['paid'] else 'partial',inv['id']))
         elif action=='employee_create':
             result['id']=db.execute('INSERT INTO finance_employees(business_id,name,document,position,salary,started,usual_account_id,note) VALUES(?,?,?,?,?,?,?,?)',(business,clean(data['name']),clean(data.get('document')),clean(data.get('position')),cents(data['salary']),valid_date(data['started']),data.get('usual_account_id') or None,clean(data.get('note'),1000))).lastrowid
         elif action=='payroll_create':

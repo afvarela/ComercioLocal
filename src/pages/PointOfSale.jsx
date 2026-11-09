@@ -31,6 +31,7 @@ export default function PointOfSale({
     [highlight, setHighlight] = useState(0),
     [cartHighlight, setCartHighlight] = useState(-1),
     [customerPicker, setCustomerPicker] = useState(false),
+    [reservationsOpen, setReservationsOpen] = useState(false),
     [customerSearch, setCustomerSearch] = useState(""),
     [marketView, setMarketView] = useState(() => localStorage.getItem("comercio-pos-market-view") === "rows" ? "rows" : "cards");
   const input = useRef(null);
@@ -41,7 +42,7 @@ export default function PointOfSale({
   useEffect(() => {
     function captureScanner(event) {
       const tag = event.target?.tagName;
-      if (document.querySelector("dialog[open]") || ["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
+      if (document.querySelector("dialog[open], .customer-picker-backdrop") || ["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
       if (event.key.length === 1 && /^[a-zA-Z0-9_-]$/.test(event.key)) {
         event.preventDefault();
         setSearch((value) => value + event.key);
@@ -56,6 +57,7 @@ export default function PointOfSale({
       if (event.key === "F8" && cart.length) {
         event.preventDefault();
         const index = cartHighlight >= 0 ? cartHighlight : cart.length - 1;
+        if (cart[index]?.reservation_id) return;
         onProduct(cart[index].id, index, undefined, { product: cart[index] });
       }
     }
@@ -95,6 +97,15 @@ export default function PointOfSale({
     ...new Set(state.products.map((p) => p.category).filter(Boolean)),
   ];
   const customerResults = filterCustomers(state.customers, customerSearch);
+  const dairyReservations = state.dairy_reservations || [];
+  const milkProductIds = new Set((state.dairy_products || []).filter((product) => String(product.code || product.name).toUpperCase().includes("LECHE")).map((product) => Number(product.id)));
+  const cheeseProductIds = new Set((state.dairy_products || []).filter((product) => String(product.code || product.name).toUpperCase().includes("QUESO")).map((product) => Number(product.id)));
+  const reservedMilk = dairyReservations.filter((reservation) => milkProductIds.has(Number(reservation.product_id))).reduce((sum, reservation) => sum + Number(reservation.qty || 0), 0);
+  const reservedCheese = dairyReservations.filter((reservation) => cheeseProductIds.has(Number(reservation.product_id))).reduce((sum, reservation) => sum + Number(reservation.qty || 0), 0);
+  function reservationAction(action, id) {
+    setReservationsOpen(false);
+    onAction(action, id);
+  }
   function add(id, index, scanned = false, product = null) {
     onProduct(id, index, () => {
       if (scanned) {
@@ -236,8 +247,10 @@ export default function PointOfSale({
             Guardar cotización
           </Button>
         )}
+        {business === 1 && !vegetables && <Button onClick={() => setReservationsOpen(true)}>Reservas de lácteos ({dairyReservations.length})</Button>}
         <Button onClick={() => onAction("unregistered_product")}>Producto no registrado</Button>
       </Head>
+      {business === 1 && !vegetables && <div className="dairy-reservation-summary" aria-label="Resumen de reservas de lácteos">Reservas · Leche: <b>{reservedMilk.toLocaleString("es-CO")} litros</b> · Quesos: <b>{reservedCheese.toLocaleString("es-CO")} unidades</b></div>}
       {!!parkedSales.length&&<div className="parked-sales"><b>Ventas en espera</b>{parkedSales.map((sale,i)=><button key={sale.id} onClick={()=>onResumeSale(sale.id)}>Venta {i+1}<small>{sale.cart.length} producto(s) · {cop(cartTotal(sale.cart))}</small></button>)}</div>}
       <div className="pos-grid">
         <section>
@@ -417,8 +430,8 @@ export default function PointOfSale({
                     <span>{cop(lineTotal(l))}</span>
                   </div>
                   <div className="cart-line-foot">
-                    <button disabled={l.unregistered} onClick={() => !l.unregistered&&add(l.id, i, false, l)}>
-                      {stockLabel(l.qty, l.unit)} ✎
+                    <button disabled={l.unregistered || l.reservation_id} onClick={() => !l.unregistered&&!l.reservation_id&&add(l.id, i, false, l)}>
+                      {stockLabel(l.qty, l.unit)} {l.reservation_id ? "· reserva" : "✎"}
                     </button>
                     <span>
                       {cop(l.price)}/{base(l.unit, l.price_basis)}
@@ -475,6 +488,19 @@ export default function PointOfSale({
             {customerResults.map((customer) => <button type="button" key={customer.id} className={Number(customerId) === customer.id ? "selected" : ""} onClick={() => { setCustomerId(String(customer.id)); setCustomerPicker(false); }}><b>{customer.name}</b><small>CC {customer.document || "Sin documento"} · saldo {cop(customer.balance)}</small></button>)}
           </div>
           <Button onClick={() => onAction("new_customer")}>+ Crear cliente nuevo</Button>
+        </div>
+      </div>}
+      {reservationsOpen && <div className="customer-picker-backdrop" role="dialog" aria-modal="true" aria-label="Reservas de lácteos">
+        <div className="customer-picker-dialog dairy-reservation-dialog">
+          <div className="dialog-header"><div><h2>Reservas de lácteos</h2><small>Leche: {reservedMilk.toLocaleString("es-CO")} litros · Quesos: {reservedCheese.toLocaleString("es-CO")} unidades</small></div><button type="button" className="close" onClick={() => setReservationsOpen(false)}>×</button></div>
+          <div className="dairy-reservation-list">
+            {dairyReservations.map((reservation) => <div className="dairy-reservation-row" key={reservation.id}>
+              <div><b>{reservation.product_name} · {reservation.qty} unidad(es)</b><small>{reservation.customer_name || "Sin nombre"}{reservation.phone ? ` · ${reservation.phone}` : ""}{reservation.note ? ` · ${reservation.note}` : ""}</small></div>
+              <div className="actions"><Button primary onClick={() => reservationAction("dairy_reservation_pay", reservation.id)}>Cobrar</Button><Button onClick={() => reservationAction("dairy_reservation_reduce", reservation.id)}>Reducir</Button><Button className="danger" onClick={() => reservationAction("dairy_reservation_delete", reservation.id)}>Eliminar</Button></div>
+            </div>)}
+            {!dairyReservations.length && <div className="empty"><strong>No hay reservas pendientes</strong><br />Crea una cuando un cliente aparte leche o queso.</div>}
+          </div>
+          <div className="dialog-actions"><Button primary onClick={() => reservationAction("dairy_reservation")}>+ Crear nueva reserva</Button><Button onClick={() => setReservationsOpen(false)}>Cerrar</Button></div>
         </div>
       </div>}
       {vegetables && (

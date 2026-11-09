@@ -114,11 +114,11 @@ try {
 }
 
 Write-Host '7/7 Verificando la aplicacion publicada...'
-& $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.3.9'
+& $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.5.0'
 if ($LASTEXITCODE -ne 0) {
   Write-Host 'Cloudflare sigue respondiendo con la version anterior. Se repetira el despliegue del Worker...' -ForegroundColor Yellow
   $PublicUrl = Publish-Worker
-  & $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.3.9'
+  & $Node (Join-Path $Project 'scripts\check-deployment.mjs') $PublicUrl '3.5.0'
   if ($LASTEXITCODE -ne 0) { throw "La aplicacion publicada en $PublicUrl no paso la verificacion despues de dos despliegues." }
 }
 [IO.File]::WriteAllText((Join-Path $Project 'cloudflare\deployment-url.txt'), $PublicUrl, [Text.UTF8Encoding]::new($false))

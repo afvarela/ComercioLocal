@@ -1,4 +1,4 @@
-const CACHE = "comercio-local-20261105095236";
+const CACHE = "comercio-local-20261109142529";
 const PRODUCT_IMAGES = [
   "aguacate.svg", "arveja.jpg", "banano.svg", "cebolla-cabezona.jpg",
   "cebolla-larga.jpg", "cilantro.svg", "fresa.svg", "habichuela.jpg",

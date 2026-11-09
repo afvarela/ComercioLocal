@@ -32,9 +32,12 @@ def dairy_state(store,user,start=None,end=None):
           FROM dairy_sale_lines l JOIN dairy_products p ON p.id=l.product_id JOIN sales s ON s.id=l.sale_id JOIN users u ON u.id=l.user_id
           WHERE substr(l.created,1,10) BETWEEN ? AND ? ORDER BY l.created DESC,l.id DESC""",(start,end))
         closures=rows(db,'SELECT c.*,u.name operator FROM dairy_closures c JOIN users u ON u.id=c.closed_by WHERE c.day BETWEEN ? AND ? ORDER BY c.day DESC',(start,end))
+        reservations=rows(db,"""SELECT r.*,p.name product_name,p.unit,u.name operator
+          FROM dairy_reservations r JOIN dairy_products p ON p.id=r.product_id JOIN users u ON u.id=r.user_id
+          WHERE r.status='Pendiente' ORDER BY r.created,r.id""")
         milk=[x for x in lines if x['product_id']==1 and x['status']=='active']; cheese=[x for x in lines if x['product_id']==2 and x['status']=='active']
         net=lambda xs,key:sum(max(0,x[key]-x['returned_amount' if key=='total' else 'returned_qty']) for x in xs)
-        return {'permission':one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(user['id'],)),'products':products,'lines':lines,'closures':closures,'start':start,'end':end,'summary':{'milk_qty':net(milk,'qty'),'milk_total':net(milk,'total'),'cheese_qty':net(cheese,'qty'),'cheese_total':net(cheese,'total'),'total':net(milk,'total')+net(cheese,'total')}}
+        return {'permission':one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(user['id'],)),'products':products,'lines':lines,'closures':closures,'reservations':reservations,'start':start,'end':end,'summary':{'milk_qty':net(milk,'qty'),'milk_total':net(milk,'total'),'cheese_qty':net(cheese,'qty'),'cheese_total':net(cheese,'total'),'total':net(milk,'total')+net(cheese,'total')}}
 
 def dairy_command(store,user,action,data):
     required={'price':'price','return':'void','close':'close','reopen':'reopen'}.get(action,'view')
@@ -44,6 +47,21 @@ def dairy_command(store,user,action,data):
             product=one(db,'SELECT * FROM dairy_products WHERE id=?',(int(data['product_id']),)); value=cents(data['price'])
             if not product or value<=0: raise ValueError('Producto o precio inválido')
             db.execute('UPDATE dairy_products SET price=? WHERE id=?',(value,product['id']))
+        elif action=='reservation':
+            product=one(db,'SELECT * FROM dairy_products WHERE id=? AND active=1',(int(data.get('product_id') or 0),))
+            qty=float(data.get('qty') or 0); request_id=clean(data.get('request_id')) or secrets.token_urlsafe(18)
+            if not product or not qty.is_integer() or qty<=0 or qty>100000: raise ValueError('Seleccione leche o queso e indique una cantidad entera mayor que cero')
+            existing=one(db,'SELECT id FROM dairy_reservations WHERE request_id=?',(request_id,))
+            if existing: return {'ok':True,'id':existing['id']}
+            stamp=now(); result['id']=db.execute("INSERT INTO dairy_reservations(product_id,qty,customer_name,phone,note,created,user_id,status,updated,request_id) VALUES(?,?,?,?,?,?,?,'Pendiente',?,?)",(product['id'],int(qty),clean(data.get('customer_name')),clean(data.get('phone')),clean(data.get('note')),stamp,user['id'],stamp,request_id)).lastrowid
+        elif action=='reservation_reduce':
+            reservation=one(db,"SELECT * FROM dairy_reservations WHERE id=? AND status='Pendiente'",(int(data.get('id') or 0),)); qty=float(data.get('qty') or 0)
+            if not reservation or not qty.is_integer() or qty<=0 or qty>=reservation['qty']: raise ValueError('La nueva cantidad debe ser entera, mayor que cero y menor que la reservada')
+            db.execute('UPDATE dairy_reservations SET qty=?,updated=? WHERE id=?',(int(qty),now(),reservation['id'])); result['id']=reservation['id']
+        elif action=='reservation_delete':
+            reservation=one(db,"SELECT * FROM dairy_reservations WHERE id=? AND status='Pendiente'",(int(data.get('id') or 0),))
+            if not reservation: raise ValueError('La reserva ya no está pendiente')
+            db.execute("UPDATE dairy_reservations SET status='Eliminada',updated=? WHERE id=?",(now(),reservation['id'])); result['id']=reservation['id']
         elif action=='return':
             line=one(db,"SELECT l.*,COALESCE((SELECT SUM(qty) FROM dairy_returns WHERE line_id=l.id),0) returned FROM dairy_sale_lines l WHERE l.id=? AND l.status='active'",(int(data['line_id']),))
             qty=round(float(data['qty'])*1000); reason=clean(data.get('reason')); rid=clean(data.get('request_id')) or secrets.token_urlsafe(18)

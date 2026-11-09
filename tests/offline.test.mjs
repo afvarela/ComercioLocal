@@ -41,6 +41,18 @@ test("usa el estado local si Cloudflare D1 alcanza su limite diario", async () =
   });
 });
 
+test("una consulta D1 exitosa no falla cuando localStorage está lleno", async () => {
+  storage.clear(); storage.failKey = "pos-api-cache-v2"; navigator.onLine = true;
+  Object.defineProperty(globalThis, "fetch", {
+    value: async () => new Response(JSON.stringify({ stock_moves: [{ id: 1, name: "Arroz" }], has_more: false }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    configurable: true,
+  });
+  const result = await api(1, "/api/stock-moves?start=2026-11-01&end=2026-11-06&q=arroz&type=Venta");
+  assert.equal(result.stock_moves[0].name, "Arroz");
+  storage.failKey = null; navigator.onLine = false;
+  Object.defineProperty(globalThis, "fetch", { value: async () => { throw new TypeError("offline"); }, configurable: true });
+});
+
 test("una recarga offline no mezcla ventas de otra fecha", async () => {
   storage.clear();
   const previous = { sales: [{ id: 9 }], stock_moves: [] };

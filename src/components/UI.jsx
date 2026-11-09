@@ -220,6 +220,10 @@ export function Modal({
 export function DateRange({ start, end, onApply }) {
   const [a, setA] = useState(start),
     [b, setB] = useState(end);
+  useEffect(() => {
+    setA(start);
+    setB(end);
+  }, [start, end]);
   return (
     <div className="date-range">
       <input
@@ -235,7 +239,7 @@ export function DateRange({ start, end, onApply }) {
         value={b}
         onChange={(e) => setB(e.target.value)}
       />
-      <Button onClick={() => onApply(a, b)}>Aplicar</Button>
+      <Button type="button" disabled={!a || !b || a > b} onClick={() => onApply(a, b)}>Aplicar</Button>
     </div>
   );
 }

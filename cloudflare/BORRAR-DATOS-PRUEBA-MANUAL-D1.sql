@@ -19,6 +19,7 @@ DELETE FROM dispatch_lines;
 DELETE FROM dispatches;
 DELETE FROM label_settings;
 
+DELETE FROM dairy_reservations;
 DELETE FROM dairy_returns;
 DELETE FROM dairy_payments;
 DELETE FROM dairy_sale_lines;
@@ -31,6 +32,7 @@ DELETE FROM finance_reinvestment_uses;
 DELETE FROM finance_invoice_payments;
 DELETE FROM finance_payroll_payments;
 DELETE FROM finance_reconciliations;
+DELETE FROM finance_bank_closures;
 DELETE FROM finance_movements;
 DELETE FROM finance_payrolls;
 DELETE FROM finance_employees;

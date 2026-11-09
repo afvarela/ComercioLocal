@@ -31,7 +31,7 @@ export default function Checkout({ total, cart, customers, customerId, requestId
     if (credit && !client) throw Error("Busca y selecciona el cliente responsable del fiado.");
     await onSave({
       lines: cart.filter((line) => !line.unregistered&&!line.dairy).map((line) => ({ product_id: line.id, qty: qty(line.qty, line.unit) })),
-      dairy_lines: cart.filter((line) => line.dairy).map((line) => ({ product_id: line.dairy_product_id, qty: qty(line.qty, line.unit) })),
+      dairy_lines: cart.filter((line) => line.dairy).map((line) => ({ product_id: line.dairy_product_id, qty: qty(line.qty, line.unit), reservation_id: line.reservation_id || null })),
       unregistered_lines: cart.filter((line) => line.unregistered).map(unregisteredLinePayload),
       payments: methods.map((method) => ({ method, amount: values[method] || 0 })),
       customer_id: Number(client) || null,

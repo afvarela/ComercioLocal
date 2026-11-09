@@ -14,6 +14,15 @@ test("la migración D1 es aditiva y conserva la información existente", () => {
   assert.doesNotMatch(sql, /\b(?:DROP|DELETE FROM products|DELETE FROM lots|DELETE FROM sales)\b/i);
 });
 
+test("la migración de trazabilidad reconstruye saldos sin borrar inventario", () => {
+  const sql = read("cloudflare/migrations/0023_stock_traceability.sql");
+  assert.match(sql, /ADD COLUMN balance_before/);
+  assert.match(sql, /ADD COLUMN request_id/);
+  assert.match(sql, /SUM\(later\.qty\)/);
+  assert.match(sql, /idx_stock_moves_request/);
+  assert.doesNotMatch(sql, /\b(?:DROP|DELETE FROM products|DELETE FROM lots|DELETE FROM stock_moves)\b/i);
+});
+
 test("la instrumentación registra rows_read y rows_written sin parámetros", () => {
   const source = read("cloudflare/store.mjs");
   assert.match(source, /meta\.rows_read/);
@@ -88,6 +97,22 @@ test("el POS no solicita historial ni lotes completos en cada venta", () => {
 test("no existe polling periódico contra las rutas D1", () => {
   const source = [read("src/App.jsx"), read("src/lib/api.js")].join("\n");
   assert.doesNotMatch(source, /setInterval\s*\(/);
+});
+
+test("filtrar movimientos usa una sola ruta indexada sin recargar el catálogo", () => {
+  const app = read("src/App.jsx"), worker = read("cloudflare/worker.mjs"), cloud = read("cloudflare/read.mjs");
+  assert.match(app, /\/api\/stock-moves\?\$\{params\}/);
+  assert.match(worker, /path==='\/api\/stock-moves'/);
+  assert.match(cloud, /export async function stockHistory/);
+  assert.match(cloud, /m\.business_id=\? AND m\.created>=\? AND m\.created<\?/);
+  assert.match(cloud, /m\.kind=\?/);
+});
+
+test("existencias por lote no vuelve a descargar los 1500 productos", () => {
+  const pages = read("src/pages/AdminPages.jsx"), worker = read("cloudflare/worker.mjs"), cloud = read("cloudflare/read.mjs");
+  assert.match(pages, /"\/api\/inventory-lots"/);
+  assert.match(worker, /inventoryLots/);
+  assert.match(cloud, /WHERE l\.business_id=\? AND l\.qty>0/);
 });
 
 test("el resumen de caja agrupa las lecturas y usa un índice por caja", () => {

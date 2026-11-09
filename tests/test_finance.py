@@ -36,6 +36,37 @@ class FinanceTests(unittest.TestCase):
         self.assertEqual(nequi['balance'],before-250000000)
         self.assertLess(nequi['balance'],0)
 
+    def test_closed_cash_sales_enter_bank_once_by_payment_method(self):
+        before={x['name']:x['balance'] for x in finance_state(self.store,self.user,1)['accounts']}
+        with self.store.connect() as db:
+            cash=db.execute("INSERT INTO cash_sessions(business_id,user_id,opened,opening,closed,counted,expected,note,closed_by) VALUES(1,?,?,?,?,?,?,?,?)",(self.user['id'],'2026-11-05T08:00:00-05:00',0,'2026-11-05T20:00:00-05:00',100000,100000,'',self.user['id'])).lastrowid
+            sale=db.execute("INSERT INTO sales(business_id,number,user_id,cash_id,created,total,cost,debt,request_id) VALUES(1,1,?,?,?,600000,0,0,?)",(self.user['id'],cash,'2026-11-05T10:00:00-05:00',uuid.uuid4().hex)).lastrowid
+            values=[('Efectivo',120000,'Venta'),('Efectivo',-20000,'Devolución'),('Nequi',200000,'Venta'),('Bancolombia',300000,'Venta'),('Nequi',50000,'Abono')]
+            for method,amount,kind in values: db.execute('INSERT INTO payments(business_id,sale_id,cash_id,user_id,created,method,amount,kind) VALUES(1,?,?,?,?,?,?,?)',(sale,cash,self.user['id'],'2026-11-05T10:00:00-05:00',method,amount,kind))
+        first=finance_state(self.store,self.user,1); second=finance_state(self.store,self.user,1)
+        balances={x['name']:x['balance'] for x in second['accounts']}
+        self.assertEqual((balances['Efectivo']-before['Efectivo'],balances['Nequi']-before['Nequi'],balances['Bancolombia']-before['Bancolombia']),(100000,200000,300000))
+        self.assertEqual(len(second['bank_closures']),1)
+        self.assertEqual((second['bank_closures'][0]['efectivo'],second['bank_closures'][0]['nequi'],second['bank_closures'][0]['bancolombia'],second['bank_closures'][0]['total']),(100000,200000,300000,600000))
+        self.assertEqual((second['bank']['Efectivo']['balance'],second['bank']['Nequi']['balance'],second['bank']['Bancolombia']['balance'],second['bank']['total']),(100000,200000,300000,600000))
+        self.assertEqual(len([x for x in second['movements'] if x['source_type']=='cash_close']),3)
+        self.assertEqual(len(first['bank_closures']),len(second['bank_closures']))
+
+    def test_invoice_can_be_edited_and_paid_with_multiple_bank_methods(self):
+        before={x['name']:x['balance'] for x in finance_state(self.store,self.user,1)['accounts']}
+        invoice=self.cmd('invoice_create',{'invoice_date':today(),'number':'FC-1','description':'Compra inicial','total':1000,'payments':[{'account_id':101,'amount':400}]})['id']
+        self.cmd('invoice_edit',{'invoice_id':invoice,'invoice_date':today(),'number':'FC-1-A','description':'Compra corregida','total':1500,'supplier':'Proveedor','payments':[{'account_id':102,'amount':500},{'account_id':103,'amount':750}]})
+        state=finance_state(self.store,self.user,1); item=next(x for x in state['invoices'] if x['id']==invoice); balances={x['name']:x['balance'] for x in state['accounts']}
+        self.assertEqual((item['number'],item['description'],item['total'],item['paid'],item['status']),('FC-1-A','Compra corregida',150000,125000,'partial'))
+        self.assertEqual({x['account']:x['amount'] for x in item['payments']},{'Nequi':50000,'Bancolombia':75000})
+        self.assertEqual(balances['Efectivo'],before['Efectivo'])
+        self.assertEqual(balances['Nequi'],before['Nequi']-50000)
+        self.assertEqual(balances['Bancolombia'],before['Bancolombia']-75000)
+        self.cmd('invoice_pay',{'invoice_id':invoice,'date':today(),'payments':[{'account_id':101,'amount':100},{'account_id':102,'amount':150}]})
+        paid=next(x for x in finance_state(self.store,self.user,1)['invoices'] if x['id']==invoice)
+        self.assertEqual((paid['paid'],paid['status']),(150000,'paid'))
+        with self.store.connect() as db: self.assertEqual(db.execute("SELECT COUNT(*) FROM finance_invoice_payments WHERE invoice_id=? AND status='void'",(invoice,)).fetchone()[0],1)
+
     def test_profit_values_are_independent_from_profit_and_sales(self):
         profit=self.cmd('profit_create',{'period':'2026-11','profit':1000000,'date':today(),'allocations':[{'account_id':102,'amount':125000}]})['id']
         self.cmd('profit_fund',{'profit_id':profit,'date':today(),'allocations':[{'account_id':102,'amount':25000},{'account_id':103,'amount':50000}]})

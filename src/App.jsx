@@ -476,6 +476,15 @@ export default function App() {
     if (type === "product") payload = { ...d, id, perishable: !!d.perishable, active: id ? !!d.active : true };
     if (type === "customer") payload = { ...d, id, request_id: id ? undefined : modal.requestId };
     if (type === "unregistered_option") payload = { ...d, id, active: id ? !!d.active : true };
+    if (["dairy_reservation", "dairy_reservation_reduce", "dairy_reservation_delete"].includes(type)) {
+      const dairyAction = type === "dairy_reservation" ? "reservation" : type === "dairy_reservation_reduce" ? "reservation_reduce" : "reservation_delete";
+      const reservationId = modal.reservation?.id || id;
+      await api(business, "/api/dairy-command", { action: dairyAction, data: { ...d, id: reservationId, request_id: modal.requestId } });
+      close();
+      await refresh(business, start, end, { history: false });
+      toast(type === "dairy_reservation" ? "Reserva guardada. Ya aparece en el punto de venta." : type === "dairy_reservation_reduce" ? "Cantidad de la reserva actualizada." : "Reserva eliminada.");
+      return;
+    }
     if (type === "customer_payment") {
       const allocations=Object.entries(d).filter(([key,value])=>key.startsWith("invoice_")&&Number(value)>0).map(([key,value])=>({sale_id:Number(key.slice(8)),amount:Number(value)}));
       payload={customer_id:Number(d.customer_id),amount:allocations.length?allocations.reduce((sum,item)=>sum+item.amount,0):Number(d.amount),method:d.method,reference:d.reference,allocations,request_id:modal.requestId};
@@ -488,7 +497,7 @@ export default function App() {
     if (type === "void_purchase") payload.purchase_id = id;
     if (type === "purchase_return") payload.purchase_line_id = id;
     if (type === "sale_return") payload.sale_id = id;
-    if (["repay", "customer_payment", "cash_nequi_review", "purchase_return", "manual_purchase_return", "sale_return"].includes(type))
+    if (["repay", "customer_payment", "cash_nequi_review", "initial_stock", "receive", "waste", "void_purchase", "purchase_return", "manual_purchase_return", "sale_return"].includes(type))
       payload.request_id = modal.requestId;
     if (type === "quote")
       payload = {
@@ -624,13 +633,27 @@ export default function App() {
       saleCommit.current = null;
     }
   }
-  async function dates(a, z) {
+  async function dates(a, z, filters = {}) {
     try {
-      await refresh(business, a, z);
+      if (!a || !z || a > z) throw Error("Seleccione un rango de fechas válido");
+      if (view === "inventory") {
+        const params = new URLSearchParams({ start: a, end: z, limit: "500" });
+        if (filters.search?.trim()) params.set("q", filters.search.trim());
+        if (filters.type) params.set("type", filters.type);
+        const result = await api(business, `/api/stock-moves?${params}`);
+        setHistory((current) => ({ ...(current || {}), stock_moves: result.stock_moves || [] }));
+        setStart(a);
+        setEnd(z);
+        return { ok: true, ...result };
+      } else {
+        setHistory(await api(business, `/api/history?start=${a}&end=${z}`));
+      }
       setStart(a);
       setEnd(z);
+      return { ok: true };
     } catch (e) {
       toast(e.message);
+      return { ok: false, error: e.message };
     }
   }
   async function action(a, id) {
@@ -647,6 +670,33 @@ export default function App() {
           if (state.dairy_access?.can_price) setView("dairy");
           else toast("No tiene permiso para configurar precios de lácteos");
           break;
+        case "dairy_reservation":
+          form("dairy_reservation");
+          break;
+        case "dairy_reservation_reduce": {
+          const reservation = (state.dairy_reservations || []).find((item) => Number(item.id) === Number(id));
+          if (!reservation) throw Error("La reserva ya no está pendiente");
+          form("dairy_reservation_reduce", id, { reservation });
+          break;
+        }
+        case "dairy_reservation_delete": {
+          const reservation = (state.dairy_reservations || []).find((item) => Number(item.id) === Number(id));
+          if (!reservation) throw Error("La reserva ya no está pendiente");
+          form("dairy_reservation_delete", id, { reservation });
+          break;
+        }
+        case "dairy_reservation_pay": {
+          const reservation = (state.dairy_reservations || []).find((item) => Number(item.id) === Number(id));
+          if (!reservation) throw Error("La reserva ya no está pendiente");
+          if (cart.some((item) => Number(item.reservation_id) === Number(reservation.id))) throw Error("Esta reserva ya está agregada a la venta actual");
+          const product = (state.dairy_products || []).find((item) => Number(item.id) === Number(reservation.product_id));
+          if (!product || Number(product.price || 0) <= 0) throw Error("Configure primero el precio vigente de este lácteo");
+          setCart((current) => [...current, { ...product, id: `dairy-${product.id}`, dairy: true, dairy_product_id: product.id, reservation_id: reservation.id, reservation_name: reservation.customer_name, sku: product.code, description: `Reserva #${reservation.id}${reservation.customer_name ? ` · ${reservation.customer_name}` : ""}`, price_basis: 1000, available: Infinity, qty: Number(reservation.qty) * 1000 }]);
+          requestId.current = uid();
+          setView("pos");
+          toast(`Reserva #${reservation.id} agregada. Cobra la venta para marcarla como vendida.`);
+          break;
+        }
         case "photo_credits":
           form("photo_credits");
           break;
@@ -711,7 +761,6 @@ export default function App() {
             statement.sales.push({id:pending.requestId,request_id:pending.requestId,number:"LOCAL",created:pending.created,original_debt:debt,debt,paid_amount:0,returned_amount:0,lines:meta.items||[]});
             statement.total_credit+=debt;statement.balance+=debt;
           }
-          if (!statement.sales?.length) throw Error("El cliente no tiene compras fiadas para imprimir");
           const businessName = state.businesses.find((item) => item.id === business)?.name || "Comercio Local";
           setModal({ type: "account_statement", businessName, statement, key: uid() });
           break;

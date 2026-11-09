@@ -147,9 +147,40 @@ export function Inventory({
     [categoryFilter,setCategoryFilter]=useState(""),
     [statusFilter,setStatusFilter]=useState("active"),
     [moveSearch,setMoveSearch]=useState(""),
-    [moveType,setMoveType]=useState("");
+    [moveType,setMoveType]=useState(""),
+    [moveLoading,setMoveLoading]=useState(false),
+    [moveError,setMoveError]=useState(""),
+    [movesTruncated,setMovesTruncated]=useState(false),
+    [lots,setLots]=useState(state.lots || []),
+    [lotsLoading,setLotsLoading]=useState(false),
+    [lotsError,setLotsError]=useState("");
+  useEffect(() => setLots(state.lots || []), [state.lots]);
+  useEffect(() => {
+    if (tab !== "moves") return undefined;
+    const timer = setTimeout(() => loadMovements(start, end, moveSearch, moveType), 350);
+    return () => clearTimeout(timer);
+  }, [tab, business, moveSearch, moveType]);
+  async function loadMovements(from=start, to=end, searchValue=moveSearch, typeValue=moveType) {
+    setMoveLoading(true); setMoveError("");
+    const result = await onDates(from, to, { search: searchValue, type: typeValue });
+    setMoveLoading(false);
+    if (!result?.ok) { setMoveError(result?.error || "No fue posible consultar los movimientos"); return; }
+    setMovesTruncated(Boolean(result.has_more));
+  }
+  async function selectTab(id) {
+    setTab(id);
+    if (id !== "lots") return;
+    setLotsLoading(true); setLotsError("");
+    try {
+      const result = await api(business, "/api/inventory-lots");
+      setLots(result.lots || []);
+    } catch (error) {
+      setLotsError(error.message);
+      setLots((current) => current.length ? current : (state.lots || []));
+    } finally { setLotsLoading(false); }
+  }
   const inventoryProducts = [...state.products, ...(state.inactive_products || [])];
-  const near = state.lots.filter(
+  const near = lots.filter(
       (l) => l.expires && l.expires <= localDate(30),
     ),
     low = state.products.filter((p) => p.available <= p.min_stock);
@@ -159,10 +190,10 @@ export function Inventory({
       (!categoryFilter || p.category === categoryFilter) &&
       matchesProductSearch(p, search),
   );
-  const movementTypes = [...new Set((history.stock_moves || []).map((movement) => movement.kind).filter(Boolean))].sort();
+  const movementTypes = [...new Set(["Venta","Compra","Inventario inicial","Merma / ajuste","Ajuste negativo","Ajuste de costo","Anulación de venta","Anulación de compra","Devolución de compra","Devolución de venta",...(history.stock_moves || []).map((movement) => movement.kind).filter(Boolean)])].sort();
   const filteredMoves = (history.stock_moves || []).filter((movement) => {
     const needle = normalize(moveSearch);
-    const matchesText = !needle || normalize(`${movement.name || ""} ${movement.code || ""} ${movement.reference || ""} ${movement.operator || ""} ${movement.note || ""}`).includes(needle);
+    const matchesText = !needle || normalize(`${movement.name || ""} ${movement.sku || ""} ${movement.barcode || ""} ${movement.code || ""} ${movement.reference || ""} ${movement.operator || ""} ${movement.note || ""}`).includes(needle);
     return matchesText && (!moveType || movement.kind === moveType);
   });
   return (
@@ -228,7 +259,7 @@ export function Inventory({
             .map(([id, label]) => (
               <button
                 className={tab === id ? "active" : ""}
-                onClick={() => setTab(id)}
+                onClick={() => selectTab(id)}
                 key={id}
               >
                 {label}
@@ -237,8 +268,8 @@ export function Inventory({
         </div>
         {tab === "moves" ? (
           <div className="report-filter-bar movement-filter-bar">
-            <DateRange start={start} end={end} onApply={onDates} />
-            <Field name="movement_search" label="Buscar movimiento" value={moveSearch} onChange={(event) => setMoveSearch(event.target.value)} placeholder="Producto, lote, documento o usuario" />
+            <DateRange start={start} end={end} onApply={(from,to) => loadMovements(from,to)} />
+            <Field name="movement_search" label="Buscar movimiento" value={moveSearch} onChange={(event) => setMoveSearch(event.target.value)} placeholder="Nombre, SKU, código de barras, lote o documento" />
             <label className="field">Tipo de movimiento<select value={moveType} onChange={(event) => setMoveType(event.target.value)}><option value="">Todos</option>{movementTypes.map((kind) => <option key={kind}>{kind}</option>)}</select></label>
           </div>
         ) : tab === "purchases" ? (
@@ -297,6 +328,8 @@ export function Inventory({
           </>
         ) : tab === "lots" ? (
           <>
+          {lotsLoading && <Notice info>Actualizando existencias por lote…</Notice>}
+          {lotsError && <Notice>No fue posible actualizar los lotes: {lotsError}. Se conserva la última información disponible.</Notice>}
           {business === 1 && <Notice info>Cada fila corresponde a un lote distinto. “INICIAL” agrupa las unidades que ya tenías cuando comenzaste; las entradas nuevas conservan su lote, vencimiento y cantidad por separado.</Notice>}
           <Table
             headers={[
@@ -306,7 +339,7 @@ export function Inventory({
               "Proveedor",
               ...(admin ? ["Costo / base", "Acción"] : []),
             ]}
-            rows={state.lots
+            rows={lots
               .filter((l) =>
                 normalize(l.name + " " + l.code).includes(normalize(search)),
               )
@@ -344,17 +377,21 @@ export function Inventory({
           />
           </>
         ) : tab === "moves" ? (
+          <>
+          {moveLoading && <Notice info>Consultando movimientos en la base de datos…</Notice>}
+          {moveError && <Notice>No fue posible aplicar el filtro: {moveError}</Notice>}
+          {movesTruncated && <Notice info>Se muestran los 500 movimientos más recientes. Escribe un producto o selecciona un tipo para precisar la búsqueda.</Notice>}
           <Table
             headers={[
-              "Fecha",
+              "Fecha y hora",
               "Producto / lote",
-              "Movimiento",
-              "Entrada",
-              "Salida",
-              "Existencia",
+              "Movimiento / documento",
+              "Existencia anterior",
+              "Cantidad (+/-)",
+              "Existencia posterior",
               "Costo unitario",
               "Costo total",
-              "Documento / usuario",
+              "Usuario",
               "Observación",
             ]}
             rows={filteredMoves.map((m) => [
@@ -363,9 +400,9 @@ export function Inventory({
                 {m.name}
                 <small>{m.code}</small>
               </>,
-              m.kind,
-              m.qty > 0 ? stockLabel(m.qty, m.unit) : "—",
-              m.qty < 0 ? stockLabel(-m.qty, m.unit) : "—",
+              <>{m.kind}<small>{m.reference}</small></>,
+              stockLabel(m.balance_before, m.unit),
+              m.qty > 0 ? `+ ${stockLabel(m.qty, m.unit)}` : m.qty < 0 ? `− ${stockLabel(-m.qty, m.unit)}` : "0",
               stockLabel(m.balance_after, m.unit),
               cop(m.cost) + " / " + base(m.unit, m.cost_basis),
               cop(
@@ -378,10 +415,11 @@ export function Inventory({
                         : 1),
                 ),
               ),
-              <>{m.reference}<small>{m.operator}</small></>,
+              m.operator,
               m.note || "—",
             ])}
           />
+          </>
         ) : (
           <Table
             headers={[
@@ -489,7 +527,7 @@ export function Customers({ state, history = {}, business, admin, onAction, star
         </Panel>
         <Panel title="Cuentas por cobrar">
           <Table
-            headers={["Cliente", "Venta", "Fecha de venta", "Vence", "Saldo", "Acción"]}
+            headers={["Cliente", "Venta", "Fecha de venta", "Vence", "Abonado", "Saldo", "Acción"]}
             rows={filteredDebts.map((d) => [
               <>
                 {d.customer}
@@ -500,12 +538,19 @@ export function Customers({ state, history = {}, business, admin, onAction, star
               <Badge tone={d.due < localDate() ? "red" : "warn"}>
                 {d.due}
               </Badge>,
+              cop(Math.max(0, Number(d.original_debt || 0) - Number(d.debt || 0))),
               cop(d.debt),
-              <Button onClick={() => onAction("repay", d.id)}>
+              <Button onClick={() => onAction("customer_payment", d.customer_id)}>
                 Registrar abono
               </Button>,
             ])}
           />
+        </Panel>
+        <Panel title="Abonos recibidos">
+          <Table headers={["Fecha", "Cliente", "Abono", "Medio", "Referencia", "Recibo"]} rows={(history.collections || []).map((item) => [
+            dt(item.created), item.customer, cop(item.amount), item.method, item.reference || "—", <Button onClick={() => onAction("receipt_collection", item.id)}>Ver</Button>,
+          ])} />
+          {!(history.collections || []).length && <Notice info>No hay abonos de cartera en el período seleccionado.</Notice>}
         </Panel>
         <Panel title="Directorio de clientes">
           <Table
@@ -609,9 +654,9 @@ export function Cash({ state, history, business, admin, onAction }) {
         <Metrics
           items={[
             {
-              label: "Total ventas (efectivo + Nequi)",
-              value: cop(c.collected_sales_total || 0),
-              note: `Efectivo neto ${cop(c.cash_sales_net ?? c.cash_sales ?? 0)} · Nequi neto ${cop(c.nequi_sales_net ?? c.nequi_sales ?? 0)} · Fiado aparte ${cop(c.credit_sales || 0)}`,
+              label: "Total recibido (ventas + abonos)",
+              value: cop(c.received_total ?? ((c.collected_sales_total || 0) + (c.cash_collections || 0) + (c.nequi_collections || 0))),
+              note: `Efectivo ${cop(c.cash_income_total ?? ((c.cash_sales_net ?? c.cash_sales ?? 0) + (c.cash_collections || 0)))} · Nequi ${cop(c.nequi_income_total ?? ((c.nequi_sales_net ?? c.nequi_sales ?? 0) + (c.nequi_collections || 0)))} · Fiado pendiente aparte ${cop(c.credit_sales || 0)}`,
             },
             {
               label: "Nequi recibido en el turno",
@@ -716,6 +761,10 @@ export function Sales({
     const methodMatches = !methodFilter || normalize(sale.payment_methods || (sale.debt ? "Fiado" : "")).includes(normalize(methodFilter));
     return customerMatches && statusMatches && methodMatches;
   });
+  const collections = history.collections || [];
+  const collectionTotal = collections.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const collectionCash = collections.filter((item) => item.method === "Efectivo").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const collectionNequi = collections.filter((item) => item.method === "Nequi").reduce((sum, item) => sum + Number(item.amount || 0), 0);
   return (
     <>
       <Head
@@ -729,6 +778,12 @@ export function Sales({
         <label className="field">Estado<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">Todos</option><option value="active">Registradas</option><option value="void">Anuladas</option><option value="local">Locales pendientes</option></select></label>
         <label className="field">Medio de pago<select value={methodFilter} onChange={(event) => setMethodFilter(event.target.value)}><option value="">Todos</option>{methods.map((method)=><option key={method}>{method}</option>)}<option>Fiado</option></select></label>
       </div>
+      <Metrics items={[
+        { label: "Ventas del período", value: cop((history.sales || []).filter((sale) => sale.status !== "void").reduce((sum, sale) => sum + Number(sale.receipt_total ?? sale.total ?? 0), 0)), note: "Facturas registradas" },
+        { label: "Abonos a fiados", value: cop(collectionTotal), note: `${collections.length} recaudo(s) recibido(s)` },
+        { label: "Abonos en efectivo", value: cop(collectionCash), note: "Entran al efectivo de caja" },
+        { label: "Abonos por Nequi", value: cop(collectionNequi), note: "Entran al recaudo de Nequi" },
+      ]} />
       <Panel>
         <Table
           headers={[
@@ -796,6 +851,15 @@ export function Sales({
             </div>,
           ])}
         />
+      </Panel>
+      <Panel className="subsection" title="Abonos recibidos de fiados">
+        <Table headers={["Recibo / fecha", "Cliente", "Valor abonado", "Medio", "Atendió", "Acción"]} rows={collections.map((item) => [
+          <><b>RC-{String(item.id).padStart(6, "0")}</b><small>{dt(item.created)}</small></>,
+          <>{item.customer}<small>{item.document || "Sin documento"}</small></>,
+          cop(item.amount), item.method, item.operator,
+          <Button onClick={() => onAction("receipt_collection", item.id)}>Ver recibo</Button>,
+        ])} />
+        {!collections.length && <Notice info>No hay abonos de cartera en el período seleccionado.</Notice>}
       </Panel>
       <Panel
         className="subsection"
@@ -950,7 +1014,7 @@ export function Reports({ history, business, start, end, onDates }) {
       {tab==="inventario" && <><Metrics items={[{label:"Inventario valorizado",value:cop(s.inventory_value),note:"Costo de existencias"},{label:"Reposiciones sugeridas",value:report.suggestions.length,note:"Según consumo y mínimos"},{label:"Productos sin movimiento",value:rotation.filter(x=>!x.sold90).length,note:"90 días"},{label:"Clasificación A",value:rotation.filter(x=>x.abc==="A").length,note:"Mayor participación"}]}/><Panel title="Rotación y sugerencias de compra"><Table headers={["Producto","ABC","Vendido 7/30/90 días","Existencia","Promedio diario","Días disponibles","Compra sugerida"]} rows={rotation.map(x=>[<>{x.name}<small>{x.sku} · {x.rotation}</small></>,<Badge tone={x.abc==="A"?"":"warn"}>{x.abc}</Badge>,`${x.sold7} / ${x.sold30} / ${x.sold90}`,stockLabel(x.stock,x.unit),x.daily_average,x.days_stock??"Sin consumo",x.suggested_qty?stockLabel(x.suggested_qty,x.unit):"—"])}/></Panel></>}
       {tab==="caja" && <Panel title="Historial de cierres y diferencias"><Table headers={["Caja / responsable","Apertura","Ventas efectivo","Recaudos","Otros ingresos","Egresos","Devoluciones","Esperado","Contado","Diferencia / justificación"]} rows={report.cash.map(x=>[<>#{x.id}<small>{x.operator}</small></>,cop(x.opening),cop(x.cash_sales),cop(x.cash_collections),cop(x.other_income),cop(x.expenses),cop(x.cash_refunds),cop(x.expected||0),x.counted==null?"—":cop(x.counted),<><Badge tone={x.difference<0?"red":x.difference>0?"warn":""}>{cop(x.difference||0)} · {x.difference_type||"Pendiente"}</Badge><small>{x.difference_reason}{x.difference_note?` · ${x.difference_note}`:""}</small></>])}/></Panel>}
       {tab==="cartera" && <div className="grid2"><Panel title="Antigüedad de saldos"><Table headers={["Rango","Cuentas","Saldo"]} rows={report.aging.map(x=>[x.bucket,x.accounts,cop(x.amount)])}/></Panel><Panel padded><h2>Distribución de cartera</h2><Bars data={report.aging} label="bucket" value="amount"/></Panel></div>}
-      {tab==="kardex" && <Panel title="Kardex de inventario"><Table headers={["Fecha","Producto / lote","Movimiento","Entrada","Salida","Saldo","Costo","Documento","Usuario"]} rows={(history.stock_moves||[]).map(x=>[dt(x.created),<>{x.name}<small>{x.code}</small></>,x.kind,x.qty>0?stockLabel(x.qty,x.unit):"—",x.qty<0?stockLabel(-x.qty,x.unit):"—",stockLabel(x.balance_after,x.unit),cop(x.cost),x.reference,x.operator])}/></Panel>}
+      {tab==="kardex" && <Panel title="Kardex de inventario"><Table headers={["Fecha y hora","Producto / lote","Movimiento / documento","Existencia anterior","Cantidad (+/-)","Existencia posterior","Costo","Usuario"]} rows={(history.stock_moves||[]).map(x=>[dt(x.created),<>{x.name}<small>{x.code}</small></>,<>{x.kind}<small>{x.reference}</small></>,stockLabel(x.balance_before,x.unit),x.qty>0?`+ ${stockLabel(x.qty,x.unit)}`:x.qty<0?`− ${stockLabel(-x.qty,x.unit)}`:"0",stockLabel(x.balance_after,x.unit),cop(x.cost),x.operator])}/></Panel>}
       {tab==="productos" && <><Metrics items={[{label:"Productos activos",value:rotation.length,note:"Empresa seleccionada"},{label:"Agotados",value:rotation.filter(x=>x.stock<=0).length,note:"Requieren revisión"},{label:"Bajo mínimo",value:rotation.filter(x=>x.stock<=x.min_stock).length,note:"Incluye agotados"},{label:"Valor del inventario",value:cop(s.inventory_value),note:"A costo"}]}/><Panel title="Inventario y comportamiento"><Table headers={["Producto","Existencia","Mínimo","Máximo","7 / 30 / 90 días","Cobertura","ABC","Estado"]} rows={rotation.map(x=>[<>{x.name}<small>{x.sku}</small></>,stockLabel(x.stock,x.unit),stockLabel(x.min_stock,x.unit),stockLabel(x.max_stock,x.unit),`${x.sold7} / ${x.sold30} / ${x.sold90}`,x.days_stock==null?"Sin consumo":`${x.days_stock} días`,x.abc,<Badge tone={x.stock<=x.min_stock?"red":""}>{x.stock<=0?"Agotado":x.stock<=x.min_stock?"Stock bajo":"Disponible"}</Badge>])}/></Panel></>}
       {tab==="auditoria" && <Panel title="Trazabilidad de acciones"><Table headers={["Fecha","Usuario","Acción","Detalle"]} rows={(history.audit||[]).map(x=>[dt(x.created),x.operator,x.action,<small>{x.detail}</small>])}/></Panel>}
       <Panel className="subsection" padded><h2>Exportar información</h2><p className="muted">Archivos CSV con títulos en español, compatibles con Excel.</p><div className="actions">

@@ -406,6 +406,31 @@ export default function OperationForm({
         </>
       );
       break;
+    case "dairy_reservation":
+      title = "Nueva reserva de leche o queso";
+      submit = "Guardar reserva";
+      body = <>
+        <Notice info>La reserva no genera una venta hasta que se cobre desde el punto de venta.</Notice>
+        <Select name="product_id" label="Tipo de reserva" required>{(state.dairy_products || []).map((item) => <option key={item.id} value={item.id}>{item.name} · por {item.unit}</option>)}</Select>
+        <Field name="qty" label="Cantidad de unidades reservadas" type="number" min="1" step="1" defaultValue="1" required />
+        <Field name="customer_name" label="Nombre (opcional)" />
+        <Field name="phone" label="Teléfono (opcional)" type="tel" />
+        <Field name="note" label="Observación (opcional)" />
+      </>;
+      break;
+    case "dairy_reservation_reduce":
+      title = "Reducir reserva";
+      submit = "Actualizar cantidad";
+      body = <>
+        <Notice info>{config.reservation?.product_name} · cantidad actual: {config.reservation?.qty} unidad(es).</Notice>
+        <Field name="qty" label="Nueva cantidad" type="number" min="1" max={Math.max(1, Number(config.reservation?.qty || 1) - 1)} step="1" required />
+      </>;
+      break;
+    case "dairy_reservation_delete":
+      title = "Eliminar reserva";
+      submit = "Sí, eliminar reserva";
+      body = <Notice>Se eliminará la reserva de {config.reservation?.qty} unidad(es) de {config.reservation?.product_name}. Esta acción no crea una venta.</Notice>;
+      break;
     case "repay":
       title = "Registrar abono";
       submit = "Guardar abono";

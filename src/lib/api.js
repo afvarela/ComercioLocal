@@ -20,6 +20,31 @@ function persistQueue(queue) {
 }
 const cacheKey = (business, path) => `${business}:${path}`;
 const isStatePath = path => path.split("?")[0] === "/api/state";
+function compactForCache(path, value) {
+  if (!value || typeof value !== "object") return value;
+  const copy = structuredClone(value);
+  if (path.startsWith("/api/stock-moves?")) copy.stock_moves = (copy.stock_moves || []).slice(0, 500);
+  if (path.startsWith("/api/history?")) {
+    const limits = { sales: 200, credit_sales: 200, sale_lines: 500, sale_payments: 500, stock_moves: 500, receivable_moves: 300, audit: 200, cash_moves: 200 };
+    for (const [key, limit] of Object.entries(limits)) if (Array.isArray(copy[key])) copy[key] = copy[key].slice(0, limit);
+  }
+  return copy;
+}
+function rememberResponse(business, path, result) {
+  try {
+    const cache = read(CACHE, {}), prefixes = ["/api/history?", "/api/stock-moves?"];
+    for (const prefix of prefixes) if (path.startsWith(prefix)) for (const key of Object.keys(cache)) if (key.startsWith(`${business}:${prefix}`)) delete cache[key];
+    cache[cacheKey(business, path)] = compactForCache(path, result);
+    if (isStatePath(path)) cache[cacheKey(business, "/api/state")] = compactForCache(path, result);
+    write(CACHE, cache);
+  } catch {
+    try {
+      const cache = read(CACHE, {});
+      for (const key of Object.keys(cache)) if (key.includes(":/api/history?") || key.includes(":/api/stock-moves?")) delete cache[key];
+      write(CACHE, cache);
+    } catch { /* El caché es auxiliar; nunca debe convertir una consulta exitosa en error. */ }
+  }
+}
 const offlineAction = (path, data) => path === "/api/command" ? data?.action : path === "/api/logistics-command" && data?.action === "status" ? "logistics_status" : "";
 const isOfflineSale = (path, data) => offlineAction(path, data) === "sale" && data?.data?.request_id;
 const isOfflineCustomer = (path, data) => offlineAction(path, data) === "customer" && !data?.data?.id && data?.data?.request_id;
@@ -338,12 +363,21 @@ async function request(business, path, data) {
   const timeout = setTimeout(() => controller.abort(), 15000);
   let response;
   try {
-    response = await fetch(`${path}${path.includes("?") ? "&" : "?"}business=${business}`, {
-      method: data === undefined ? "GET" : "POST",
-      headers: data === undefined ? {} : { "Content-Type": "application/json", "X-POS-Request": "1" },
-      body: data === undefined ? undefined : JSON.stringify(data),
-      signal: controller.signal,
-    });
+    try {
+      response = await fetch(`${path}${path.includes("?") ? "&" : "?"}business=${business}`, {
+        method: data === undefined ? "GET" : "POST",
+        headers: data === undefined ? {} : { "Content-Type": "application/json", "X-POS-Request": "1" },
+        body: data === undefined ? undefined : JSON.stringify(data),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const timeoutError = Error("La consulta tardó más de 15 segundos. Reduce el rango de fechas o escribe un producto para precisar la búsqueda.");
+        timeoutError.status = 408;
+        throw timeoutError;
+      }
+      throw error;
+    }
   } finally {
     clearTimeout(timeout);
   }
@@ -379,10 +413,7 @@ export async function api(business, path, data) {
     if (path === "/api/login" && data) await saveOfflineLogin(data);
     if (path === "/api/logout") localStorage.removeItem(LOCAL_SESSION);
     if (data === undefined) {
-      const cache = read(CACHE, {});
-      cache[cacheKey(business, path)] = result;
-      if (isStatePath(path)) cache[cacheKey(business, "/api/state")] = result;
-      write(CACHE, cache);
+      rememberResponse(business, path, result);
       if (isStatePath(path)) localStorage.setItem(LOCAL_SESSION, "1");
     }
     return path.startsWith("/api/history?") ? projectedHistory(result, business, path) : result;

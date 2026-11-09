@@ -137,8 +137,10 @@ class Store:
                 ('lots','status',"TEXT NOT NULL DEFAULT 'Activa'"),
                 ('stock_moves','cost','INTEGER NOT NULL DEFAULT 0'),
                 ('stock_moves','cost_basis','INTEGER NOT NULL DEFAULT 1000'),
+                ('stock_moves','balance_before','INTEGER NOT NULL DEFAULT 0'),
                 ('stock_moves','balance_after','INTEGER NOT NULL DEFAULT 0'),
                 ('stock_moves','note',"TEXT NOT NULL DEFAULT ''"),
+                ('stock_moves','request_id','TEXT'),
                 ('businesses','email',"TEXT NOT NULL DEFAULT ''"),
                 ('products','max_stock','INTEGER NOT NULL DEFAULT 0'),
                 ('products','reorder_point','INTEGER NOT NULL DEFAULT 0'),
@@ -160,6 +162,8 @@ class Store:
             ]:
                 if column not in [r['name'] for r in db.execute(f'PRAGMA table_info({table})')]:
                     db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            db.execute('UPDATE stock_moves SET balance_before=balance_after-qty WHERE balance_before=0 AND (balance_after!=0 OR qty!=0)')
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_moves_request ON stock_moves(business_id,request_id) WHERE request_id IS NOT NULL AND request_id!=''")
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_offline_request ON customers(business_id,request_id) WHERE request_id IS NOT NULL')
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_moves_request ON cash_moves(request_id) WHERE request_id IS NOT NULL')
             for column,definition,source in [('can_create','INTEGER NOT NULL DEFAULT 0','can_write'),('can_export','INTEGER NOT NULL DEFAULT 0','can_report')]:
@@ -200,6 +204,11 @@ class Store:
         require(table in ('products','lots','customers','sales','quotes','cash_sessions'),'Tabla inválida')
         r=self.one(db,f'SELECT * FROM {table} WHERE id=? AND business_id=?',(id,b)); require(r,'Registro no encontrado en este negocio'); return r
     def audit(self,db,u,b,action,detail): db.execute('INSERT INTO audit(business_id,user_id,created,action,detail) VALUES(?,?,?,?,?)',(b,u['id'],now(),action,json.dumps(detail,ensure_ascii=False)))
+    def audit_failure(self,u,b,action,detail,error):
+        safe={k:v for k,v in (detail or {}).items() if k not in ('password','current')}; safe['error']=clean(error,500)
+        try:
+            with self.connect() as db: self.audit(db,u,b,action+':fallida',safe)
+        except Exception as ex: print('AUDIT_FAILURE',type(ex).__name__,str(ex),flush=True)
     def admin(self,u): require(u['role']=='admin','Esta operación requiere administrador')
     def cash(self,db,b):
         c=self.one(db,'SELECT * FROM cash_sessions WHERE business_id=? AND closed IS NULL',(b,)); require(c,'Abra la caja de este negocio antes de continuar'); return c
@@ -229,7 +238,7 @@ class Store:
         last=self.one(db,'SELECT nequi_amount,decision,created FROM cash_nequi_reviews WHERE cash_id=? ORDER BY id DESC LIMIT 1',(cash_id,)) or {}
         cash_sales_net=payments['cash_sales']-payments['cash_refunds']; nequi_sales_net=payments['nequi_sales']-payments['nequi_refunds']
         expected_without_opening=payments['cash_payment_net']+moves['moves_net']; expected_total=c['opening']+expected_without_opening
-        return {'sales_total':sales['sales_total'],'collected_sales_total':cash_sales_net+nequi_sales_net,'cash_sales':payments['cash_sales'],'cash_sales_net':cash_sales_net,'nequi_sales':payments['nequi_sales'],'nequi_sales_net':nequi_sales_net,'nequi_total':payments['nequi_total'],'credit_sales':sales['credit_sales'],'cash_collections':payments['cash_collections'],'nequi_collections':payments['nequi_collections'],'cash_refunds':payments['cash_refunds'],'nequi_refunds':payments['nequi_refunds'],'adjustments_total':moves['adjustments_total'],'cash_moves_net':moves['moves_net'],'expected_total':expected_total,'expected_without_opening':expected_without_opening,'reviewed_nequi_amount':last.get('nequi_amount',0),'nequi_review_required':bool(payments['nequi_total']>last.get('nequi_amount',0))}
+        return {'sales_total':sales['sales_total'],'collected_sales_total':cash_sales_net+nequi_sales_net,'received_total':cash_sales_net+nequi_sales_net+payments['cash_collections']+payments['nequi_collections'],'cash_income_total':cash_sales_net+payments['cash_collections'],'nequi_income_total':nequi_sales_net+payments['nequi_collections'],'cash_sales':payments['cash_sales'],'cash_sales_net':cash_sales_net,'nequi_sales':payments['nequi_sales'],'nequi_sales_net':nequi_sales_net,'nequi_total':payments['nequi_total'],'credit_sales':sales['credit_sales'],'cash_collections':payments['cash_collections'],'nequi_collections':payments['nequi_collections'],'cash_refunds':payments['cash_refunds'],'nequi_refunds':payments['nequi_refunds'],'adjustments_total':moves['adjustments_total'],'cash_moves_net':moves['moves_net'],'expected_total':expected_total,'expected_without_opening':expected_without_opening,'reviewed_nequi_amount':last.get('nequi_amount',0),'nequi_review_required':bool(payments['nequi_total']>last.get('nequi_amount',0))}
     def ensure_receivables(self,db,b,customer_id=None,sale_id=None):
         filters=['s.business_id=?','s.customer_id IS NOT NULL','s.original_debt>0']; args=[b]
         if customer_id is not None: filters.append('s.customer_id=?'); args.append(customer_id)
@@ -309,7 +318,13 @@ class Store:
             c=self.one(db,'SELECT c.*,u.name operator FROM cash_sessions c JOIN users u ON u.id=c.user_id WHERE c.business_id=? AND c.closed IS NULL',(b,))
             if c: c.update(self.cash_summary(db,c),expected=self.expected(db,c))
             customers=self.rows(db,"SELECT c.*,COALESCE(s.balance,0) balance,COALESCE(s.total_purchases,0) total_purchases,COALESCE(s.purchase_count,0) purchase_count FROM customers c LEFT JOIN (SELECT customer_id,SUM(debt) balance,SUM(total) total_purchases,COUNT(*) purchase_count FROM sales WHERE business_id=? AND status='active' GROUP BY customer_id) s ON s.customer_id=c.id WHERE c.business_id=? ORDER BY c.name",(b,b)) if include_customers else []
-            return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'inactive_products':inactive_products,'lots':lots,'customers':customers,'cash':c,'unregistered_options':self.rows(db,'SELECT * FROM unregistered_options WHERE business_id=? AND (active=1 OR ?=1) ORDER BY active DESC,name',(b,int(u['role']=='admin'))),'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
+            return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'inactive_products':inactive_products,'lots':lots,'customers':customers,'cash':c,'unregistered_options':self.rows(db,'SELECT * FROM unregistered_options WHERE business_id=? AND (active=1 OR ?=1) ORDER BY active DESC,name',(b,int(u['role']=='admin'))),'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_reservations':self.rows(db,"SELECT r.*,p.name product_name,p.unit FROM dairy_reservations r JOIN dairy_products p ON p.id=r.product_id WHERE r.status='Pendiente' ORDER BY r.created,r.id") if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
+    def inventory_lots(self,u,b):
+        with self.connect() as db:
+            lots=self.rows(db,"SELECT l.*,p.name,p.sku,p.barcode,p.unit FROM lots l JOIN products p ON p.id=l.product_id WHERE l.business_id=? AND l.qty>0 ORDER BY p.name,COALESCE(l.expires,'9999'),l.id",(b,))
+            if u['role']!='admin':
+                for lot in lots: lot.pop('cost',None)
+            return {'lots':lots}
     def lines(self,db,b,raw,stock=True):
         require(isinstance(raw,list) and 0<len(raw)<=300,'Agregue productos a la venta')
         combined={}
@@ -359,9 +374,11 @@ class Store:
                     open_lots=self.rows(db,'SELECT * FROM lots WHERE product_id=? AND business_id=? AND qty>0 ORDER BY id',(pid,b)); balance=sum(x['qty'] for x in open_lots); changed=now()
                     for open_lot in open_lots:
                         db.execute('UPDATE lots SET cost=?,cost_basis=? WHERE id=? AND business_id=?',(current_cost,basis,open_lot['id'],b))
-                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,pid,open_lot['id'],u['id'],changed,0,'Ajuste de costo','MAESTRO',current_cost,basis,balance,'Costo actualizado desde el maestro de productos'))
+                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,pid,open_lot['id'],u['id'],changed,0,'Ajuste de costo','MAESTRO',current_cost,basis,balance,balance,'Costo actualizado desde el maestro de productos'))
             elif action=='initial_stock':
                 self.admin(u); require(b==1,'La carga rápida de existencia inicial solo está disponible en mini market')
+                request_id=clean(d.get('request_id')) or secrets.token_urlsafe(18); existing=self.one(db,'SELECT lot_id FROM stock_moves WHERE business_id=? AND request_id=?',(b,request_id))
+                if existing: return {'ok':True,'id':existing['lot_id']}
                 p=self.scoped(db,'products',d['product_id'],b); q=quantity(d['qty'],p['unit']); require(q>0,'Ingrese cantidad positiva')
                 unit_cost=money(d.get('cost',0)); old_qty=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(p['id'],)).fetchone()[0]
                 old_total=amount(old_qty,p['current_cost'],p['unit'],p['price_basis']); new_total=amount(q,unit_cost,p['unit'],p['price_basis'])
@@ -370,10 +387,12 @@ class Store:
                 created=now(); code='INICIAL-'+created.replace('-','').replace(':','').replace('.','')[:15]+'-'+str(p['id'])
                 lid=db.execute('INSERT INTO lots(business_id,product_id,code,expires,qty,cost,supplier,reference,created,cost_basis,original_qty,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],code,None,q,unit_cost,'Inventario inicial','Carga rápida',created,p['price_basis'],q,'Activo')).lastrowid
                 db.execute('UPDATE products SET current_cost=? WHERE id=?',(average,p['id']))
-                db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lid,u['id'],created,q,'Inventario inicial',code,unit_cost,p['price_basis'],old_qty+q,clean(d.get('note'),1000)))
+                db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lid,u['id'],created,q,'Inventario inicial',code,unit_cost,p['price_basis'],old_qty,old_qty+q,clean(d.get('note'),1000),request_id))
                 result.update(id=lid)
             elif action=='receive':
-                self.admin(u); p=self.scoped(db,'products',d['product_id'],b); q=quantity(d['qty'],p['unit']); require(q>0,'Ingrese cantidad positiva')
+                self.admin(u); request_id=clean(d.get('request_id')) or secrets.token_urlsafe(18); existing=self.one(db,'SELECT p.id purchase_id,pl.lot_id FROM purchases p LEFT JOIN purchase_lines pl ON pl.purchase_id=p.id WHERE p.business_id=? AND p.request_id=?',(b,request_id))
+                if existing: return {'ok':True,'id':existing['lot_id'],'purchase_id':existing['purchase_id']}
+                p=self.scoped(db,'products',d['product_id'],b); q=quantity(d['qty'],p['unit']); require(q>0,'Ingrese cantidad positiva')
                 created=now(); code=clean(d.get('code')) or f"AUTO-{created.replace('-','').replace(':','').replace('.','')[:15]}-{p['id']}"
                 expiry=iso(d.get('expires'),True); supplier=clean(d.get('supplier')) or 'Sin proveedor'
                 require(not expiry or expiry>=today(),'No se permite recibir mercancia vencida')
@@ -384,18 +403,19 @@ class Store:
                 divisor=p['price_basis'] if p['unit']=='g' else 1000 if p['unit']=='m' else 1
                 average=int((Decimal(old_total+new_total)*divisor/Decimal(old_qty+q)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
                 purchase_number=db.execute('SELECT COALESCE(MAX(number),0)+1 FROM purchases WHERE business_id=?',(b,)).fetchone()[0]
-                request_id=clean(d.get('request_id')) or secrets.token_urlsafe(18)
                 purchase_id=db.execute("INSERT INTO purchases(business_id,number,supplier,reference,created,user_id,total,status,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?)",(b,purchase_number,supplier,clean(d.get('reference')),now(),u['id'],new_total,'Activa',clean(d.get('note'),1000),request_id)).lastrowid
                 lid=db.execute('INSERT INTO lots(business_id,product_id,code,expires,qty,cost,supplier,reference,created,cost_basis,original_qty,purchase_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],code,expiry,q,unit_cost,supplier,clean(d.get('reference')),now(),p['price_basis'],q,purchase_id)).lastrowid
                 db.execute('INSERT INTO purchase_lines(purchase_id,product_id,lot_id,qty,cost,cost_basis,total) VALUES(?,?,?,?,?,?,?)',(purchase_id,p['id'],lid,q,unit_cost,p['price_basis'],new_total))
                 db.execute('UPDATE products SET current_cost=?,price=COALESCE(?,price) WHERE id=?',(average,sale_price,p['id']))
-                db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lid,u['id'],now(),q,'Compra',f'COMP-{purchase_number:06d}',unit_cost,p['price_basis'],old_qty+q,clean(d.get('note'),1000))); result.update(id=lid,purchase_id=purchase_id)
+                db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lid,u['id'],now(),q,'Compra',f'COMP-{purchase_number:06d}',unit_cost,p['price_basis'],old_qty,old_qty+q,clean(d.get('note'),1000),request_id+':stock')); result.update(id=lid,purchase_id=purchase_id)
             elif action=='waste':
-                self.admin(u); lot=self.scoped(db,'lots',d['lot_id'],b); p=self.scoped(db,'products',lot['product_id'],b); q=quantity(d['qty'],p['unit']); reason=clean(d.get('reason'))
+                self.admin(u); request_id=clean(d.get('request_id')) or secrets.token_urlsafe(18); existing=self.one(db,'SELECT product_id,balance_after FROM stock_moves WHERE business_id=? AND request_id=?',(b,request_id))
+                if existing: return {'ok':True,'product_id':existing['product_id'],'available':existing['balance_after']}
+                lot=self.scoped(db,'lots',d['lot_id'],b); p=self.scoped(db,'products',lot['product_id'],b); q=quantity(d['qty'],p['unit']); reason=clean(d.get('reason'))
                 require(0<q<=lot['qty'] and reason,'Revise la cantidad y escriba el motivo de la salida')
                 db.execute('UPDATE lots SET qty=qty-? WHERE id=?',(q,lot['id']))
                 balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(p['id'],)).fetchone()[0]
-                db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lot['id'],u['id'],now(),-q,'Ajuste negativo',reason,lot['cost'],lot['cost_basis'],balance,reason))
+                db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lot['id'],u['id'],now(),-q,'Ajuste negativo',reason,lot['cost'],lot['cost_basis'],balance+q,balance,reason,request_id))
                 self.update_average(db,p); result.update(product_id=p['id'],available=balance)
             elif action=='customer':
                 require(clean(d.get('name')),'Indique el nombre del cliente'); email=clean(d.get('email')); require(not email or re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email),'Correo inválido')
@@ -498,10 +518,17 @@ class Store:
                 dairy=[]
                 if dairy_raw:
                     require(b==1 and not db.execute("SELECT 1 FROM dairy_closures WHERE day=? AND status='closed'",(today(),)).fetchone(),'El recaudo de lácteos de hoy ya está cerrado')
+                    reservation_ids=set()
                     for item in dairy_raw:
                         product=self.one(db,'SELECT * FROM dairy_products WHERE id=? AND active=1',(int(item['product_id']),)); q=round(float(item['qty'])*1000)
                         require(product and product['price']>0 and q>0,'Revise el lácteo, su precio y cantidad')
-                        dairy.append({**product,'qty':q,'total':round(q*product['price']/1000)})
+                        reservation_id=int(item.get('reservation_id') or 0) or None
+                        if reservation_id:
+                            require(reservation_id not in reservation_ids,'La misma reserva no puede cobrarse dos veces')
+                            reservation=self.one(db,"SELECT * FROM dairy_reservations WHERE id=? AND status='Pendiente'",(reservation_id,))
+                            require(reservation and reservation['product_id']==product['id'] and reservation['qty']*1000==q,'La reserva cambió o ya no está pendiente; actualice el punto de venta')
+                            reservation_ids.add(reservation_id)
+                        dairy.append({**product,'qty':q,'total':round(q*product['price']/1000),'reservation_id':reservation_id})
                 require(isinstance(extras,list) and len(extras)<=50,'Productos no registrados inválidos'); clean_extras=[]
                 for item in extras:
                     description=clean(item.get('description')); q=quantity(item.get('qty',1),'und'); price=money(item.get('price')); discount=money(item.get('discount',0))
@@ -537,11 +564,13 @@ class Store:
                     for a in l['allocations']:
                         db.execute('UPDATE lots SET qty=qty-? WHERE id=?',(a['qty'],a['lot_id']))
                         lot=self.one(db,'SELECT cost,cost_basis FROM lots WHERE id=?',(a['lot_id'],)); balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(l['product_id'],)).fetchone()[0]
-                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,l['product_id'],a['lot_id'],u['id'],now(),-a['qty'],'Venta',f'VTA-{number:06d}',lot['cost'],lot['cost_basis'],balance,''))
+                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,l['product_id'],a['lot_id'],u['id'],now(),-a['qty'],'Venta',f'VTA-{number:06d}',lot['cost'],lot['cost_basis'],balance+a['qty'],balance,'',f'{request}:stock:{l["product_id"]}:{a["lot_id"]}'))
                 for x in clean_extras:
                     db.execute('INSERT INTO unregistered_sale_lines(sale_id,option_id,description,note,qty,unit,price,discount,total) VALUES(?,?,?,?,?,?,?,?,?)',(sid,x['option_id'],x['description'],x['note'],x['qty'],x['unit'],x['price'],x['discount'],x['total']))
                 sale_time=now()
                 for x in dairy: db.execute('INSERT INTO dairy_sale_lines(sale_id,product_id,qty,price,total,created,user_id) VALUES(?,?,?,?,?,?,?)',(sid,x['id'],x['qty'],x['price'],x['total'],sale_time,u['id']))
+                for x in dairy:
+                    if x.get('reservation_id'): db.execute("UPDATE dairy_reservations SET status='Vendida',sale_id=?,updated=? WHERE id=? AND status='Pendiente'",(sid,sale_time,x['reservation_id']))
                 pending_change=change; dairy_remaining=dairy_total
                 for method,val,ref in parts:
                     if method=='Efectivo': back=min(val,pending_change); val-=back; pending_change-=back
@@ -576,7 +605,7 @@ class Store:
                     for a in json.loads(l['allocations']):
                         db.execute('UPDATE lots SET qty=qty+? WHERE id=?',(a['qty'],a['lot_id']))
                         lot=self.one(db,'SELECT cost,cost_basis FROM lots WHERE id=?',(a['lot_id'],)); balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(l['product_id'],)).fetchone()[0]
-                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,l['product_id'],a['lot_id'],u['id'],now(),a['qty'],'Anulación de venta',f'VTA-{s["number"]:06d}',lot['cost'],lot['cost_basis'],balance,clean(d['reason'])))
+                        db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,l['product_id'],a['lot_id'],u['id'],now(),a['qty'],'Anulación de venta',f'VTA-{s["number"]:06d}',lot['cost'],lot['cost_basis'],balance-a['qty'],balance,clean(d['reason']),f'void-sale:{s["id"]}:stock:{l["product_id"]}:{a["lot_id"]}'))
                 for p in self.rows(db,'SELECT * FROM payments WHERE sale_id=?',(s['id'],)):
                     db.execute('INSERT INTO payments(business_id,sale_id,cash_id,user_id,created,method,amount,kind,reference) VALUES(?,?,?,?,?,?,?,?,?)',(b,s['id'],c['id'],u['id'],now(),p['method'],-p['amount'],'Anulación',clean(d['reason'])))
                 db.execute("UPDATE sales SET status='void',debt=0,void_reason=? WHERE id=?",(clean(d['reason']),s['id'])); db.execute("UPDATE dairy_sale_lines SET status='void' WHERE sale_id=?",(s['id'],))
@@ -590,10 +619,12 @@ class Store:
                 for line in pls: require(line['lot_qty']>=line['qty']-line['returned_qty'],'No se puede anular: existen ventas o movimientos posteriores. Registre una devolución parcial.')
                 for line in pls:
                     remaining=line['qty']-line['returned_qty']; p=self.scoped(db,'products',line['product_id'],b); db.execute('UPDATE lots SET qty=qty-?,status=? WHERE id=?',(remaining,'Anulada',line['lot_id'])); balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(p['id'],)).fetchone()[0]
-                    db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],line['lot_id'],u['id'],now(),-remaining,'Anulación de compra',f'COMP-{purchase["number"]:06d}',line['cost'],line['cost_basis'],balance,reason)); self.update_average(db,p)
+                    db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],line['lot_id'],u['id'],now(),-remaining,'Anulación de compra',f'COMP-{purchase["number"]:06d}',line['cost'],line['cost_basis'],balance+remaining,balance,reason,f'void-purchase:{purchase["id"]}:stock:{line["lot_id"]}')); self.update_average(db,p)
                 db.execute("UPDATE purchases SET status='Anulada',note=note || ? WHERE id=?",('\nAnulación: '+reason,purchase['id']))
             elif action in ('purchase_return','manual_purchase_return'):
                 self.admin(u); manual=action=='manual_purchase_return'; reason=clean(d.get('reason')); require(reason,'Escriba el motivo de la devolución'); request=clean(d.get('request_id')) or secrets.token_urlsafe(18)
+                existing=self.one(db,'SELECT id FROM purchase_returns WHERE business_id=? AND request_id=?',(b,request))
+                if existing: return {'ok':True,'id':existing['id']}
                 if manual:
                     lot=self.scoped(db,'lots',d['lot_id'],b); p=self.scoped(db,'products',lot['product_id'],b); q=quantity(d['qty'],p['unit']); require(0<q<=lot['qty'],'Cantidad superior al inventario disponible'); cost=money(d.get('cost') or lot['cost']); basis=lot['cost_basis']; purchase=None; purchase_line=None; supplier=clean(d.get('supplier')) or lot['supplier']
                 else:
@@ -603,11 +634,13 @@ class Store:
                 db.execute('INSERT INTO purchase_return_lines(return_id,purchase_line_id,product_id,lot_id,qty,cost,cost_basis,total) VALUES(?,?,?,?,?,?,?,?)',(rid,purchase_line['id'] if purchase_line else None,p['id'],lot['id'],q,cost,basis,total)); db.execute('UPDATE lots SET qty=qty-? WHERE id=?',(q,lot['id']))
                 if purchase_line:
                     db.execute('UPDATE purchase_lines SET returned_qty=returned_qty+? WHERE id=?',(q,purchase_line['id'])); pending=db.execute('SELECT SUM(qty-returned_qty) FROM purchase_lines WHERE purchase_id=?',(purchase,)).fetchone()[0]; db.execute('UPDATE purchases SET status=? WHERE id=?',('Devuelta' if pending==0 else 'Parcialmente devuelta',purchase))
-                balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(p['id'],)).fetchone()[0]; db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lot['id'],u['id'],now(),-q,'Devolución de compra',f'DCP-{number:06d}',cost,basis,balance,reason)); self.update_average(db,p); result['id']=rid
+                balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(p['id'],)).fetchone()[0]; db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,p['id'],lot['id'],u['id'],now(),-q,'Devolución de compra',f'DCP-{number:06d}',cost,basis,balance+q,balance,reason,request+':stock')); self.update_average(db,p); result['id']=rid
             elif action=='sale_return':
                 self.admin(u); c=self.cash(db,b); line=self.one(db,'SELECT l.*,s.business_id,s.customer_id,s.cash_id,s.debt,s.status sale_status FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE l.id=? AND s.business_id=?',(d['sale_line_id'],b)); require(line and line['sale_status']=='active','Línea de venta no disponible'); q=quantity(d['qty'],line['unit']); returned=db.execute('SELECT COALESCE(SUM(qty),0) FROM sales_return_lines WHERE sale_line_id=?',(line['id'],)).fetchone()[0]; require(0<q<=line['qty']-returned,'La devolución supera la cantidad vendida'); method=d.get('method'); require(method in METHODS,'Medio de devolución inválido'); reason=clean(d.get('reason')); require(reason,'Escriba el motivo'); total=amount(q,line['price'],line['unit'],line['price_basis']); cost=int((Decimal(q)*line['cost']/line['qty']).quantize(Decimal('1'),rounding=ROUND_HALF_UP)); debt_reduction=min(total,line['debt']); refund=total-debt_reduction
                 if method=='Efectivo': require(self.expected(db,c)>=refund,'No hay efectivo suficiente para realizar la devolución')
-                number=db.execute('SELECT COALESCE(MAX(number),0)+1 FROM sales_returns WHERE business_id=?',(b,)).fetchone()[0]; request=clean(d.get('request_id')) or secrets.token_urlsafe(18); restock=int(bool(d.get('restock')))
+                number=db.execute('SELECT COALESCE(MAX(number),0)+1 FROM sales_returns WHERE business_id=?',(b,)).fetchone()[0]; request=clean(d.get('request_id')) or secrets.token_urlsafe(18); existing=self.one(db,'SELECT id FROM sales_returns WHERE business_id=? AND request_id=?',(b,request))
+                if existing: return {'ok':True,'id':existing['id']}
+                restock=int(bool(d.get('restock')))
                 rid=db.execute('INSERT INTO sales_returns(business_id,number,sale_id,customer_id,cash_id,created,user_id,reason,note,refund_method,total,debt_reduction,stock_return,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,number,line['sale_id'],line['customer_id'],c['id'],now(),u['id'],reason,clean(d.get('note'),1000),method,total,debt_reduction,restock,request)).lastrowid
                 db.execute('INSERT INTO sales_return_lines(return_id,sale_line_id,product_id,qty,price,price_basis,total,cost,restock) VALUES(?,?,?,?,?,?,?,?,?)',(rid,line['id'],line['product_id'],q,line['price'],line['price_basis'],total,cost,restock))
                 if debt_reduction:
@@ -618,7 +651,7 @@ class Store:
                     for a in json.loads(line['allocations']):
                         take=min(remaining,a['qty']);
                         if take:
-                            db.execute('UPDATE lots SET qty=qty+? WHERE id=?',(take,a['lot_id'])); lot=self.one(db,'SELECT cost,cost_basis FROM lots WHERE id=?',(a['lot_id'],)); balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(line['product_id'],)).fetchone()[0]; db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_after,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(b,line['product_id'],a['lot_id'],u['id'],now(),take,'Devolución de venta',f'DVT-{number:06d}',lot['cost'],lot['cost_basis'],balance,reason)); remaining-=take
+                            db.execute('UPDATE lots SET qty=qty+? WHERE id=?',(take,a['lot_id'])); lot=self.one(db,'SELECT cost,cost_basis FROM lots WHERE id=?',(a['lot_id'],)); balance=db.execute('SELECT COALESCE(SUM(qty),0) FROM lots WHERE product_id=?',(line['product_id'],)).fetchone()[0]; db.execute('INSERT INTO stock_moves(business_id,product_id,lot_id,user_id,created,qty,kind,reference,cost,cost_basis,balance_before,balance_after,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(b,line['product_id'],a['lot_id'],u['id'],now(),take,'Devolución de venta',f'DVT-{number:06d}',lot['cost'],lot['cost_basis'],balance-take,balance,reason,f'{request}:stock:{a["lot_id"]}')); remaining-=take
                         if not remaining: break
                 result['id']=rid
             elif action=='settings':
@@ -663,10 +696,10 @@ class Store:
         with self.connect() as db:
             customer=self.scoped(db,'customers',customer_id,b)
             self.ensure_receivables(db,b,customer_id=customer_id)
-            sales=self.rows(db,"""SELECT s.id,s.number,s.created,s.total,s.original_debt,s.debt,s.due,
-              COALESCE(r.paid_amount,MAX(0,s.original_debt-s.debt)) paid_amount,COALESCE(r.returned_amount,0) returned_amount
-              FROM sales s LEFT JOIN receivables r ON r.sale_id=s.id
-              WHERE s.business_id=? AND s.customer_id=? AND s.original_debt>0 AND s.status='active'
+            sales=self.rows(db,"""SELECT s.id,s.number,s.created,s.total,s.original_debt,r.balance debt,s.due,
+              r.paid_amount,r.returned_amount
+              FROM sales s JOIN receivables r ON r.sale_id=s.id
+              WHERE s.business_id=? AND s.customer_id=? AND r.balance>0 AND r.status IN ('Pendiente','Parcialmente pagado') AND s.status='active'
               ORDER BY s.created,s.id""",(b,customer_id))
             if not sales: return {'customer':customer,'sales':[],'total_credit':0,'payments':0,'returns':0,'balance':0}
             ids=[x['id'] for x in sales]; marks=','.join('?' for _ in ids)
@@ -684,9 +717,9 @@ class Store:
             debts=self.rows(db,"SELECT s.*,c.name customer,c.phone,c.document FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.debt>0 AND s.status='active' ORDER BY s.due,s.id",(b,))
             if u['role']!='admin':
                 for s in sales+debts: s.pop('cost',None)
-            result={'sales':sales,'debts':debts,'credit_sales':self.rows(db,"SELECT s.id,s.number,s.created,s.customer_id,c.name customer,s.original_debt,s.debt,s.status FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.original_debt>0 AND s.status='active' AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY s.created DESC,s.id DESC",(b,start,end)),'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,"SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY l.id DESC",(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
+            result={'sales':sales,'debts':debts,'credit_sales':self.rows(db,"SELECT s.id,s.number,s.created,s.customer_id,c.name customer,s.original_debt,s.debt,s.status FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.original_debt>0 AND s.status='active' AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY s.created DESC,s.id DESC",(b,start,end)),'collections':self.rows(db,"SELECT x.*,c.name customer,c.document,u.name operator FROM collections x JOIN customers c ON c.id=x.customer_id JOIN users u ON u.id=x.user_id WHERE x.business_id=? AND date(x.created,'-5 hours') BETWEEN ? AND ? ORDER BY x.id DESC",(b,start,end)),'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,"SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY l.id DESC",(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}
             if u['role']=='admin':
-                result['stock_moves']=self.rows(db,"SELECT m.*,p.name,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND date(m.created,'-5 hours') BETWEEN ? AND ? ORDER BY m.id DESC",(b,start,end))
+                result['stock_moves']=self.rows(db,"SELECT m.*,p.name,p.sku,p.barcode,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND date(m.created,'-5 hours') BETWEEN ? AND ? ORDER BY m.id DESC",(b,start,end))
                 result['payments']=self.rows(db,"SELECT method,kind,SUM(amount) amount FROM payments WHERE business_id=? AND date(created,'-5 hours') BETWEEN ? AND ? GROUP BY method,kind",(b,start,end))
                 result['sale_payments']=self.rows(db,"SELECT sale_id,method,amount,kind FROM payments WHERE business_id=? AND date(created,'-5 hours') BETWEEN ? AND ?",(b,start,end))
                 result['top']=self.rows(db,"SELECT l.product_id,l.name,l.unit,SUM(l.qty) qty,SUM(l.total) total,SUM(l.total-l.cost) margin FROM sale_lines l JOIN sales s ON s.id=l.sale_id WHERE s.business_id=? AND s.status='active' AND date(s.created,'-5 hours') BETWEEN ? AND ? GROUP BY l.product_id,l.name,l.unit ORDER BY total DESC",(b,start,end))
@@ -696,6 +729,20 @@ class Store:
                 result['finance_permissions']=self.rows(db,'SELECT * FROM finance_permissions ORDER BY user_id,business_id')
                 result['dairy_permissions']=self.rows(db,'SELECT * FROM dairy_permissions ORDER BY user_id')
             return result
+    def stock_history(self,u,b,start,end,search='',kind='',limit=500):
+        self.admin(u); start=iso(start); end=iso(end); require(start<=end,'Rango de fechas inválido'); search=clean(search,120); kind=clean(kind,120); limit=max(1,min(1000,int(limit or 500)))
+        with self.connect() as db:
+            where=["m.business_id=?","date(m.created,'-5 hours') BETWEEN ? AND ?"]; args=[b,start,end]
+            if search:
+                pattern='%'+search.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'; alternatives=["p.name LIKE ? ESCAPE '\\'","p.sku LIKE ? ESCAPE '\\'","COALESCE(p.barcode,'') LIKE ? ESCAPE '\\'","l.code LIKE ? ESCAPE '\\'","m.reference LIKE ? ESCAPE '\\'","m.note LIKE ? ESCAPE '\\'"]; search_args=[pattern]*6
+                normalized=''.join(char for char in unicodedata.normalize('NFD',search.lower()) if unicodedata.category(char)!='Mn'); terms=[term for term in re.sub(r'[^a-z0-9]+',' ',normalized).split() if term]
+                if terms and all(len(term)>=3 for term in terms):
+                    match=' AND '.join('"'+term.replace('"','""')+'"' for term in terms); product_ids=[row['product_id'] for row in self.rows(db,'SELECT product_id FROM product_search WHERE product_search MATCH ? AND business_id=? LIMIT 500',(match,b))]
+                    if product_ids: alternatives.append(f"m.product_id IN ({','.join('?' for _ in product_ids)})"); search_args.extend(product_ids)
+                where.append('('+ ' OR '.join(alternatives) +')'); args.extend(search_args)
+            if kind: where.append('m.kind=?'); args.append(kind)
+            args.append(limit); movements=self.rows(db,f"SELECT m.*,p.name,p.sku,p.barcode,p.unit,l.code,u.name operator FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE {' AND '.join(where)} ORDER BY m.id DESC LIMIT ?",args)
+            return {'stock_moves':movements,'has_more':len(movements)==limit,'limit':limit}
     def analytics(self,u,b,start,end):
         self.admin(u); start=iso(start); end=iso(end); require(start<=end,'Rango de fechas inválido')
         with self.connect() as db:
@@ -746,7 +793,7 @@ class Store:
             if kind=='ventas': headers=['Venta','Fecha','Cliente','Usuario','Caja','Total','Costo','Utilidad','Fiado','Estado']; raw=self.rows(db,"SELECT s.number,s.created,COALESCE(c.name,'Consumidor final') customer,u.name operator,s.cash_id,s.total,s.cost,s.total-s.cost profit,s.original_debt,CASE s.status WHEN 'void' THEN 'Anulada' ELSE 'Registrada' END state FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND s.total>0 AND substr(s.created,1,10) BETWEEN ? AND ? ORDER BY s.created",args); data=[list(x.values()) for x in raw]; money_cols=(5,6,7,8); totals=(5,6,7,8); title='Reporte de ventas'
             elif kind=='recaudos': headers=['Fecha','Cliente','Venta','Movimiento','Valor aplicado','Saldo posterior','Usuario','Observación']; raw=self.rows(db,"SELECT m.created,c.name,m.sale_id,m.kind,ABS(m.amount) amount,m.balance_after,u.name operator,m.note FROM receivable_moves m JOIN customers c ON c.id=m.customer_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? AND m.kind LIKE 'Abono%' ORDER BY m.created",args); data=[list(x.values()) for x in raw]; money_cols=(4,5); totals=(4,); title='Reporte de recaudos'
             elif kind=='cartera': headers=['Cliente','Documento','Teléfono','Fecha venta','Vencimiento','Valor original','Valor abonado','Saldo','Estado']; raw=self.rows(db,"SELECT c.name,c.document,c.phone,substr(s.created,1,10),s.due,r.original_amount,r.paid_amount,r.balance,r.status FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id WHERE r.business_id=? ORDER BY c.name,s.created",(b,)); data=[list(x.values()) for x in raw]; money_cols=(5,6,7); totals=(5,6,7); title='Reporte de cartera'
-            elif kind=='kardex': headers=['Fecha','Producto','Lote','Movimiento','Documento','Entrada','Salida','Saldo','Costo unitario','Usuario','Observación']; raw=self.rows(db,"SELECT m.created,p.name product,l.code,m.kind,m.reference,CASE WHEN m.qty>0 THEN m.qty ELSE 0 END incoming,CASE WHEN m.qty<0 THEN -m.qty ELSE 0 END outgoing,m.balance_after,m.cost,u.name operator,m.note FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND substr(m.created,1,10) BETWEEN ? AND ? ORDER BY m.created,m.id",args); data=[list(x.values()) for x in raw]; money_cols=(8,); totals=(); title='Kardex'
+            elif kind=='kardex': headers=['Fecha','Producto','Lote','Movimiento','Documento','Existencia anterior','Cantidad (+/-)','Existencia posterior','Costo unitario','Usuario','Observación']; raw=self.rows(db,"SELECT m.created,p.name product,l.code,m.kind,m.reference,m.balance_before,m.qty,m.balance_after,m.cost,u.name operator,m.note FROM stock_moves m JOIN products p ON p.id=m.product_id JOIN lots l ON l.id=m.lot_id JOIN users u ON u.id=m.user_id WHERE m.business_id=? AND date(m.created,'-5 hours') BETWEEN ? AND ? ORDER BY m.created,m.id",args); data=[list(x.values()) for x in raw]; money_cols=(8,); totals=(); title='Kardex'
             elif kind=='caja': headers=['Caja','Apertura','Cierre','Usuario','Base inicial','Esperado','Contado','Diferencia','Tipo','Razón','Observación']; raw=self.rows(db,"SELECT c.id,c.opened,c.closed,u.name,c.opening,c.expected,c.counted,c.difference,c.difference_type,c.difference_reason,c.difference_note FROM cash_sessions c JOIN users u ON u.id=c.user_id WHERE c.business_id=? AND substr(c.opened,1,10) BETWEEN ? AND ? ORDER BY c.opened",args); data=[list(x.values()) for x in raw]; money_cols=(4,5,6,7); totals=(4,7); title='Reporte de caja'
             elif kind=='auditoria': headers=['Fecha','Usuario','Acción','Detalle']; raw=self.rows(db,"SELECT a.created,COALESCE(u.name,'Sistema'),a.action,a.detail FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.business_id=? AND substr(a.created,1,10) BETWEEN ? AND ? ORDER BY a.created",args); data=[list(x.values()) for x in raw]; money_cols=(); totals=(); title='Reporte de auditoría'
             else: raise ValueError('Reporte inválido')
@@ -921,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self): self.handle_request(False)
     def do_POST(self): self.handle_request(True)
     def handle_request(self,post):
+        failure=None
         try:
             parsed=urlparse(self.path); path=parsed.path; q=parse_qs(parsed.query)
             if post:
@@ -930,7 +978,7 @@ class Handler(BaseHTTPRequestHandler):
             else: d={}
             if path=='/api/status' and not post:
                 with self.store.connect() as db: setup=not bool(db.execute('SELECT 1 FROM users WHERE active=1').fetchone())
-                return self.respond(200,{'setup':setup,'version':'3.3.9'})
+                return self.respond(200,{'setup':setup,'version':'3.5.0'})
             if path=='/api/setup' and post: return self.respond(200,self.store.setup(d))
             if path=='/api/login' and post:
                 key=self.client_address[0]; attempts=[x for x in self.attempts.get(key,[]) if x>time.time()-300]; require(len(attempts)<10,'Espere cinco minutos antes de intentar nuevamente'); attempts.append(time.time()); self.attempts[key]=attempts
@@ -943,12 +991,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(200,{'ok':True},headers={'Set-Cookie':'pos_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
                 allowed=json.loads(u['businesses']); b=int(q.get('business',[allowed[0]])[0]); require(b in allowed,'No tiene acceso a este negocio')
                 if path=='/api/state' and not post: return self.respond(200,self.store.state(u,b,q.get('catalog',['1'])[0]!='0',q.get('details',['1'])[0]!='0',q.get('customers',['1'])[0]!='0'))
+                if path=='/api/inventory-lots' and not post: return self.respond(200,self.store.inventory_lots(u,b))
                 if path=='/api/catalog' and not post: return self.respond(200,self.store.catalog(b,q.get('after',[0])[0],q.get('since',[0])[0],q.get('limit',[30])[0]))
                 if path=='/api/product-search' and not post: return self.respond(200,self.store.product_search(b,q.get('q',[''])[0],q.get('limit',[90])[0],q.get('exact',['0'])[0]=='1'))
                 if path=='/api/logistics' and not post: return self.respond(200,logistics_state(self.store,u,b,q.get('search',[''])[0]))
                 if path=='/api/dispatch-sale' and not post: return self.respond(200,sale_options(self.store,u,b,int(q['id'][0])))
                 if path=='/api/logistics-command' and post: return self.respond(200,logistics_command(self.store,u,b,d['action'],d.get('data',{})))
                 if path=='/api/history' and not post: return self.respond(200,self.store.history(u,b,q.get('start',[today()])[0],q.get('end',[today()])[0]))
+                if path=='/api/stock-moves' and not post: return self.respond(200,self.store.stock_history(u,b,q.get('start',[today()])[0],q.get('end',[today()])[0],q.get('q',[''])[0],q.get('type',[''])[0],q.get('limit',['500'])[0]))
                 if path=='/api/customer-statement' and not post: return self.respond(200,self.store.customer_statement(u,b,int(q.get('id',['0'])[0])))
                 if path=='/api/dairy' and not post: require(b==1,'Módulo disponible en mini market'); return self.respond(200,dairy_state(self.store,u,q.get('start',[today()])[0],q.get('end',[today()])[0]))
                 if path=='/api/dairy-command' and post: require(b==1,'Módulo disponible en mini market'); return self.respond(200,dairy_command(self.store,u,d['action'],d.get('data',{})))
@@ -976,7 +1026,11 @@ class Handler(BaseHTTPRequestHandler):
                         lines=self.store.rows(db,'SELECT l.*,COALESCE((SELECT SUM(sr.qty) FROM sales_return_lines sr WHERE sr.sale_line_id=l.id),0) returned_qty FROM sale_lines l WHERE l.sale_id=? ORDER BY l.id',(result['id'],))
                     result['lines']=[line for line in lines if line['returned_qty']<line['qty']]
                     return self.respond(200,result)
-                if path=='/api/command' and post: return self.respond(200,self.store.command(u,b,d['action'],d.get('data',{})))
+                if path=='/api/command' and post:
+                    action=d['action']; payload=d.get('data',{})
+                    if action in {'sale','initial_stock','receive','waste','void_sale','void_purchase','purchase_return','manual_purchase_return','sale_return'}: failure=(u,b,action,payload)
+                    result=self.store.command(u,b,action,payload); failure=None
+                    return self.respond(200,result)
                 if path=='/api/send-emails' and post: return self.respond(200,self.store.send_queue(u,b))
                 if path=='/receipt' and not post: return self.respond(200,self.store.receipt(b,q['kind'][0],int(q['id'][0])),'text/html; charset=utf-8')
                 if path=='/receipt.txt' and not post: return self.respond(200,self.store.receipt_text(b,q['kind'][0],int(q['id'][0])),'text/plain; charset=utf-8')
@@ -1006,7 +1060,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.store.admin(u); kind=q.get('kind',['sales'])[0]; require(kind in ('sales','stock_moves','payments','top','debts','cash_moves','audit'),'Reporte inválido'); data=self.store.history(u,b,q.get('start',[today()])[0],q.get('end',[today()])[0])[kind]
                     out=io.StringIO(); writer=csv.writer(out,delimiter=';')
                     if data:
-                        labels={'id':'ID','number':'Número','created':'Fecha','customer':'Cliente','operator':'Vendedor','total':'Total','cost':'Costo','debt':'Saldo pendiente','status':'Estado','due':'Vencimiento','name':'Producto','unit':'Unidad','qty':'Cantidad','margin':'Utilidad bruta','method':'Método de pago','kind':'Tipo de movimiento','amount':'Valor','reference':'Documento / referencia','supplier':'Proveedor','action':'Acción','detail':'Detalle','reason':'Motivo','balance_after':'Existencia después','note':'Observación','cash_id':'Caja'}
+                        labels={'id':'ID','number':'Número','created':'Fecha y hora','customer':'Cliente','operator':'Vendedor','total':'Total','cost':'Costo','debt':'Saldo pendiente','status':'Estado','due':'Vencimiento','name':'Producto','sku':'SKU','barcode':'Código de barras','unit':'Unidad','qty':'Cantidad del movimiento','margin':'Utilidad bruta','method':'Método de pago','kind':'Tipo de movimiento','amount':'Valor','reference':'Documento / referencia','supplier':'Proveedor','action':'Acción','detail':'Detalle','reason':'Motivo','balance_before':'Existencia anterior','balance_after':'Existencia posterior','request_id':'Identificador de operación','note':'Observación','cash_id':'Caja'}
                         writer.writerow([labels.get(k,k.replace('_',' ').capitalize()) for k in data[0].keys()])
                         for row in data:
                             writer.writerow([("'"+v if isinstance(v,str) and v.startswith(('=','+','-','@','\t','\r')) else v) for v in row.values()])
@@ -1023,8 +1077,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200,file.read_bytes(),ctype)
         except (ValueError,KeyError,TypeError,sqlite3.IntegrityError) as ex:
             msg='Referencia o código duplicado, o dato que incumple una restricción' if isinstance(ex,sqlite3.IntegrityError) else str(ex)
+            if failure: self.store.audit_failure(*failure,msg)
             self.respond(400,{'error':msg})
         except Exception as ex:
+            if failure: self.store.audit_failure(*failure,str(ex))
             print(type(ex).__name__,str(ex),flush=True); self.respond(500,{'error':'No fue posible completar la operación. Los cambios no confirmados se revierten.'})
 
 def main():

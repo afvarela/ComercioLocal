@@ -39,6 +39,57 @@ class CommerceTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.sale(p,2,10000)
         self.assertEqual(self.store.state(self.u,1)['products'][0]['available'],1)
         self.assertEqual(self.store.history(self.u,1,today(),today())['sales'],[])
+
+    def test_stock_traceability_and_sale_idempotency(self):
+        p=self.product('Producto auditado'); receive_request=uuid.uuid4().hex
+        self.run_cmd('receive',{'product_id':p,'qty':10,'cost':3000,'supplier':'Proveedor','request_id':receive_request})
+        sale_request=uuid.uuid4().hex
+        payload={'request_id':sale_request,'lines':[{'product_id':p,'qty':3}],'payments':[{'method':'Efectivo','amount':15000}]}
+        first=self.run_cmd('sale',payload); second=self.run_cmd('sale',payload)
+        self.assertEqual(first['id'],second['id'])
+        with self.store.connect() as db:
+            moves=db.execute('SELECT kind,qty,balance_before,balance_after,request_id FROM stock_moves WHERE product_id=? ORDER BY id',(p,)).fetchall()
+            self.assertEqual([(x['kind'],x['qty'],x['balance_before'],x['balance_after']) for x in moves],[('Compra',10,0,10),('Venta',-3,10,7)])
+            self.assertEqual(db.execute('SELECT qty FROM lots WHERE product_id=?',(p,)).fetchone()['qty'],7)
+            self.assertEqual(db.execute("SELECT COUNT(*) n FROM stock_moves WHERE request_id LIKE ?",(sale_request+':stock:%',)).fetchone()['n'],1)
+
+    def test_failed_sale_rolls_back_inventory_and_movements(self):
+        p=self.product('Producto sin saldo'); self.lot(p,1)
+        with self.store.connect() as db: before=db.execute('SELECT COUNT(*) n FROM stock_moves').fetchone()['n']
+        with self.assertRaises(ValueError): self.sale(p,2,10000)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) n FROM stock_moves').fetchone()['n'],before)
+            self.assertEqual(db.execute('SELECT SUM(qty) n FROM lots WHERE product_id=?',(p,)).fetchone()['n'],1)
+
+    def test_failed_inventory_operation_is_audited_without_false_movement(self):
+        p=self.product('Producto con fallo'); self.lot(p,1)
+        with self.store.connect() as db: before=db.execute('SELECT COUNT(*) n FROM stock_moves').fetchone()['n']
+        self.store.audit_failure(self.u,1,'sale',{'product_id':p,'qty':2},'Existencias insuficientes')
+        with self.store.connect() as db:
+            audit=db.execute("SELECT action,detail FROM audit WHERE action='sale:fallida' ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertIsNotNone(audit); self.assertIn('Existencias insuficientes',audit['detail'])
+            self.assertEqual(db.execute('SELECT COUNT(*) n FROM stock_moves').fetchone()['n'],before)
+
+    def test_stock_history_includes_entire_final_colombia_day(self):
+        p=self.product('Producto por fecha'); self.lot(p,2)
+        with self.store.connect() as db:
+            move=db.execute('SELECT id FROM stock_moves WHERE product_id=?',(p,)).fetchone()['id']
+            db.execute("UPDATE stock_moves SET created='2026-01-02T04:59:59.000Z' WHERE id=?",(move,))
+        history=self.store.history(self.u,1,'2026-01-01','2026-01-01')
+        self.assertEqual([x['id'] for x in history['stock_moves']],[move])
+        focused=self.store.stock_history(self.u,1,'2026-01-01','2026-01-01')
+        self.assertEqual([x['id'] for x in focused['stock_moves']],[move])
+
+    def test_stock_history_filters_in_database_by_product_type_and_date(self):
+        first=self.run_cmd('product',{'sku':'SKU-ORIGINAL','barcode':'770123','name':'SHAMPOO JOHNSONS ORIGINAL 25ML','unit':'und','price':1800})['id']
+        second=self.run_cmd('product',{'sku':'SKU-ARROZ','barcode':'770999','name':'ARROZ BLANQUITA','unit':'und','price':3000})['id']
+        self.lot(first,3,1000); self.lot(second,2,1500); self.sale(first,1,1800)
+        result=self.store.stock_history(self.u,1,today(),today(),'ORIGINAL','Venta')
+        self.assertEqual(len(result['stock_moves']),1); self.assertEqual(result['stock_moves'][0]['product_id'],first); self.assertEqual(result['stock_moves'][0]['kind'],'Venta')
+        barcode=self.store.stock_history(self.u,1,today(),today(),'770999','Compra')
+        self.assertEqual(len(barcode['stock_moves']),1); self.assertEqual(barcode['stock_moves'][0]['product_id'],second)
+        none=self.store.stock_history(self.u,1,'2020-01-01','2020-01-02','ORIGINAL','Venta')
+        self.assertEqual(none['stock_moves'],[])
     def test_product_search_finds_partial_words_with_accents_and_stock(self):
         product=self.run_cmd('product',{'sku':'TDESC-00737','barcode':'7701234567890','name':'SHAMPOO JÓHNSONS ORIGINAL 25ML','description':'Línea para niños','category':'Aseo','unit':'und','price':1800})['id']
         self.run_cmd('product',{'sku':'TDESC-00782','name':'JABON DOVE 75 G ORIGINAL','description':'Importado desde Excel, fila 782. UM original: un','category':'Aseo','unit':'und','price':2500})
@@ -88,6 +139,8 @@ class CommerceTests(unittest.TestCase):
         lots={x['id']:x for x in state['lots']}
         self.assertTrue(lots[initial]['code'].startswith('INICIAL-'))
         self.assertEqual(lots[initial]['qty'],7)
+        focused={x['id']:x for x in self.store.inventory_lots(self.u,1)['lots']}
+        self.assertEqual(focused[initial]['qty'],7); self.assertEqual(focused[regular]['qty'],5)
         self.assertEqual(lots[regular]['qty'],5)
         self.sale(p,8,72000)
         with self.store.connect() as db:
@@ -425,5 +478,27 @@ class CommerceTests(unittest.TestCase):
         self.assertEqual((statement['total_credit'],statement['payments'],statement['balance']),(1200000,500000,700000))
         self.assertEqual(statement['sales'][0]['lines'][0]['name'],'Avena de fresa')
         self.assertEqual(statement['sales'][0]['lines'][0]['qty'],2)
+
+    def test_paid_credit_disappears_and_new_credit_starts_clean_statement(self):
+        p=self.product('Producto fiado',price=6000);self.lot(p,3);customer=self.run_cmd('customer',{'name':'Cliente cuenta nueva','credit_limit':0})['id']
+        first=self.sale(p,1,0,customer_id=customer,allow_credit=True,due=today())
+        payment=self.run_cmd('customer_payment',{'customer_id':customer,'amount':6000,'method':'Nequi','request_id':uuid.uuid4().hex})
+        self.assertEqual(self.store.customer_statement(self.u,1,customer)['sales'],[])
+        second=self.sale(p,1,0,customer_id=customer,allow_credit=True,due=today())
+        statement=self.store.customer_statement(self.u,1,customer)
+        self.assertEqual([sale['id'] for sale in statement['sales']],[second['id']])
+        self.assertEqual((statement['total_credit'],statement['payments'],statement['balance']),(600000,0,600000))
+        history=self.store.history(self.u,1,today(),today())
+        collection=next(item for item in history['collections'] if item['id']==payment['id'])
+        self.assertEqual((collection['amount'],collection['method']),(600000,'Nequi'))
+        cash=self.store.state(self.u,1)['cash']
+        self.assertEqual((cash['nequi_collections'],cash['received_total'],cash['nequi_income_total']),(600000,600000,600000))
+
+    def test_partial_credit_payment_reports_amount_and_remaining_balance(self):
+        p=self.product('Compra parcial',price=10000);self.lot(p,1);customer=self.run_cmd('customer',{'name':'Cliente parcial','credit_limit':0})['id']
+        self.sale(p,1,0,customer_id=customer,allow_credit=True,due=today())
+        self.run_cmd('customer_payment',{'customer_id':customer,'amount':3500,'method':'Efectivo','request_id':uuid.uuid4().hex})
+        statement=self.store.customer_statement(self.u,1,customer);sale=statement['sales'][0]
+        self.assertEqual((sale['paid_amount'],sale['debt'],statement['payments'],statement['balance']),(350000,650000,350000,650000))
 
 if __name__=='__main__': unittest.main(verbosity=2)

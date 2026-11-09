@@ -33,5 +33,16 @@ class DairyTests(unittest.TestCase):
   with self.assertRaises(ValueError): self.store.command(self.user,1,'sale',{'request_id':uuid.uuid4().hex,'lines':[],'dairy_lines':[{'product_id':1,'qty':1}],'payments':[{'method':'Efectivo','amount':4000}]})
   dairy_command(self.store,self.user,'reopen',{'day':today(),'reason':'Corrección autorizada'})
   self.assertEqual(dairy_state(self.store,self.user)['closures'][0]['status'],'reopened')
+ def test_reservation_can_be_reduced_sold_or_deleted(self):
+  reservation=dairy_command(self.store,self.user,'reservation',{'product_id':1,'qty':3,'customer_name':'Ana','phone':'300123','request_id':uuid.uuid4().hex})
+  state=dairy_state(self.store,self.user);self.assertEqual((state['reservations'][0]['id'],state['reservations'][0]['qty'],state['reservations'][0]['customer_name']),(reservation['id'],3,'Ana'))
+  dairy_command(self.store,self.user,'reservation_reduce',{'id':reservation['id'],'qty':2})
+  sale=self.store.command(self.user,1,'sale',{'request_id':uuid.uuid4().hex,'lines':[],'dairy_lines':[{'product_id':1,'qty':2,'reservation_id':reservation['id']}],'payments':[{'method':'Efectivo','amount':6000}]})
+  with self.store.connect() as db:
+   saved=db.execute('SELECT status,sale_id FROM dairy_reservations WHERE id=?',(reservation['id'],)).fetchone()
+  self.assertEqual((saved['status'],saved['sale_id']),('Vendida',sale['id']));self.assertEqual(dairy_state(self.store,self.user)['reservations'],[])
+  other=dairy_command(self.store,self.user,'reservation',{'product_id':2,'qty':1,'request_id':uuid.uuid4().hex})
+  dairy_command(self.store,self.user,'reservation_delete',{'id':other['id']})
+  with self.store.connect() as db:self.assertEqual(db.execute('SELECT status FROM dairy_reservations WHERE id=?',(other['id'],)).fetchone()[0],'Eliminada')
 
 if __name__=='__main__':unittest.main()
