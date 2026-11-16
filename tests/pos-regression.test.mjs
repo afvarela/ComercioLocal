@@ -71,9 +71,22 @@ test("estado de cuenta muestra el abono parcial y el saldo de la factura pendien
     sales: [{ number: 22, created: "2026-11-09T12:00:00Z", paid_amount: 250000, debt: 750000, lines: [] }],
     total_credit: 1000000, payments: 250000, returns: 0, balance: 750000,
   });
-  assert.match(html, /Abono aplicado/);
+  assert.match(html, /Abonos posteriores/);
   assert.match(html, /Saldo pendiente/);
   assert.match(html, /Solo se muestran facturas con saldo pendiente/);
+});
+
+test("estado de cuenta separa el abono inicial del saldo fiado", () => {
+  const html = accountStatementHtml("Tienda El Descanso", {
+    customer: { name: "Fabio Sarmiento", document: "123" },
+    sales: [{ number: 1862, created: "2026-11-14T18:22:00Z", total: 2290000, original_debt: 1790000, initial_paid: 500000, paid_amount: 0, debt: 1790000, lines: [{ name: "Productos varios", qty: 1, unit: "und", price: 2290000, price_basis: 1, total: 2290000 }] }],
+    total_sales: 2290000, initial_payments: 500000, total_credit: 1790000, payments: 0, returns: 0, balance: 1790000,
+  });
+  assert.match(html, /Total de venta[\s\S]*\$\s22\.900/);
+  assert.match(html, /Abono inicial[\s\S]*\$\s5\.000/);
+  assert.match(html, /Saldo pendiente[\s\S]*\$\s17\.900/);
+  assert.match(html, /Total de ventas/);
+  assert.match(html, /Abonos al comprar/);
 });
 
 test("POS permite crear cobrar reducir y eliminar reservas de lácteos", () => {

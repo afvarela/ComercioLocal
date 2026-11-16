@@ -317,7 +317,12 @@ class Store:
                 for l in lots: l.pop('cost',None)
             c=self.one(db,'SELECT c.*,u.name operator FROM cash_sessions c JOIN users u ON u.id=c.user_id WHERE c.business_id=? AND c.closed IS NULL',(b,))
             if c: c.update(self.cash_summary(db,c),expected=self.expected(db,c))
-            customers=self.rows(db,"SELECT c.*,COALESCE(s.balance,0) balance,COALESCE(s.total_purchases,0) total_purchases,COALESCE(s.purchase_count,0) purchase_count FROM customers c LEFT JOIN (SELECT customer_id,SUM(debt) balance,SUM(total) total_purchases,COUNT(*) purchase_count FROM sales WHERE business_id=? AND status='active' GROUP BY customer_id) s ON s.customer_id=c.id WHERE c.business_id=? ORDER BY c.name",(b,b)) if include_customers else []
+            customers=self.rows(db,"""SELECT c.*,COALESCE(s.balance,0) balance,COALESCE(s.total_purchases,0) total_purchases,COALESCE(s.purchase_count,0) purchase_count
+              FROM customers c
+              LEFT JOIN (SELECT sales.customer_id,SUM(CASE WHEN r.id IS NULL THEN sales.debt ELSE r.balance END) balance,SUM(sales.total) total_purchases,COUNT(*) purchase_count
+                FROM sales LEFT JOIN receivables r ON r.sale_id=sales.id
+                WHERE sales.business_id=? AND sales.status='active' GROUP BY sales.customer_id) s ON s.customer_id=c.id
+              WHERE c.business_id=? ORDER BY c.name""",(b,b)) if include_customers else []
             return {'user':u,'businesses':self.rows(db,'SELECT * FROM businesses WHERE id IN (%s)' % ','.join('?' for _ in json.loads(u['businesses'])),json.loads(u['businesses'])), 'products':products,'inactive_products':inactive_products,'lots':lots,'customers':customers,'cash':c,'unregistered_options':self.rows(db,'SELECT * FROM unregistered_options WHERE business_id=? AND (active=1 OR ?=1) ORDER BY active DESC,name',(b,int(u['role']=='admin'))),'finance_access':self.one(db,'SELECT * FROM finance_permissions WHERE user_id=? AND business_id=?',(u['id'],b)),'dairy_products':self.rows(db,'SELECT * FROM dairy_products WHERE active=1 ORDER BY id') if b==1 else [],'dairy_reservations':self.rows(db,"SELECT r.*,p.name product_name,p.unit FROM dairy_reservations r JOIN dairy_products p ON p.id=r.product_id WHERE r.status='Pendiente' ORDER BY r.created,r.id") if b==1 else [],'dairy_access':self.one(db,'SELECT * FROM dairy_permissions WHERE user_id=?',(u['id'],)) if b==1 else None,'smtp_configured':bool(os.getenv('POS_SMTP_HOST'))}
     def inventory_lots(self,u,b):
         with self.connect() as db:
@@ -475,11 +480,13 @@ class Store:
                 existing=self.one(db,'SELECT id FROM collections WHERE request_id=?',(request,))
                 if existing: return {'ok':True,'id':existing['id'],'receipt':'collection'}
                 method=d.get('method'); require(method in METHODS,'Medio de pago inválido')
-                value=money(d.get('amount')); require(value>0,'Ingrese un valor mayor que cero')
                 self.ensure_receivables(db,b,customer_id=cid)
                 pending=self.rows(db,"SELECT * FROM receivables WHERE business_id=? AND customer_id=? AND balance>0 AND status!='Anulado' ORDER BY created,id",(b,cid))
                 require(pending,'El cliente no tiene cuentas pendientes')
-                requested=d.get('allocations') or []
+                pay_all=bool(d.get('pay_all'))
+                value=sum(row['balance'] for row in pending) if pay_all else money(d.get('amount'))
+                require(value>0,'Ingrese un valor mayor que cero')
+                requested=[] if pay_all else (d.get('allocations') or [])
                 if requested:
                     pending_by_sale={int(row['sale_id']):row for row in pending}; selected=[]; seen=set()
                     for item in requested:
@@ -499,7 +506,9 @@ class Store:
                     db.execute('INSERT INTO receivable_moves(receivable_id,business_id,customer_id,sale_id,payment_id,created,kind,amount,balance_after,user_id,note,request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(rec['id'],b,cid,rec['sale_id'],payment,now(),'Abono automático',-applied,new,u['id'],clean(d.get('reference')),f'{request}:{rec["id"]}'))
                     remaining-=applied; applied_count+=1
                     if not remaining: break
-                result.update(id=collection,receipt='collection',allocations=applied_count)
+                require(remaining==0,'No fue posible aplicar el pago completo; no se guardó ningún cambio')
+                balance=db.execute("SELECT COALESCE(SUM(balance),0) FROM receivables WHERE business_id=? AND customer_id=? AND balance>0 AND status!='Anulado'",(b,cid)).fetchone()[0]
+                result.update(id=collection,receipt='collection',allocations=applied_count,amount=value,balance=balance)
             elif action=='quote':
                 require(b==2,'Las cotizaciones están disponibles en ferretería'); raw=d.get('lines') or []; lines=self.lines(db,b,raw,False) if raw else []
                 for item in d.get('unregistered_lines') or []:
@@ -696,12 +705,12 @@ class Store:
         with self.connect() as db:
             customer=self.scoped(db,'customers',customer_id,b)
             self.ensure_receivables(db,b,customer_id=customer_id)
-            sales=self.rows(db,"""SELECT s.id,s.number,s.created,s.total,s.original_debt,r.balance debt,s.due,
-              r.paid_amount,r.returned_amount
+            sales=self.rows(db,"""SELECT s.id,s.number,s.created,s.total+COALESCE(s.dairy_total,0) total,s.original_debt,
+              MAX(0,s.total+COALESCE(s.dairy_total,0)-s.original_debt) initial_paid,r.balance debt,s.due,r.paid_amount,r.returned_amount
               FROM sales s JOIN receivables r ON r.sale_id=s.id
               WHERE s.business_id=? AND s.customer_id=? AND r.balance>0 AND r.status IN ('Pendiente','Parcialmente pagado') AND s.status='active'
               ORDER BY s.created,s.id""",(b,customer_id))
-            if not sales: return {'customer':customer,'sales':[],'total_credit':0,'payments':0,'returns':0,'balance':0}
+            if not sales: return {'customer':customer,'sales':[],'total_sales':0,'initial_payments':0,'total_credit':0,'payments':0,'returns':0,'balance':0}
             ids=[x['id'] for x in sales]; marks=','.join('?' for _ in ids)
             lines=self.rows(db,f'SELECT sale_id,name,unit,qty,price,total,price_basis FROM sale_lines WHERE sale_id IN ({marks}) ORDER BY id',ids)
             lines+=self.rows(db,f"SELECT sale_id,description name,unit,qty,price,total,1 price_basis FROM unregistered_sale_lines WHERE sale_id IN ({marks}) ORDER BY id",ids)
@@ -709,12 +718,12 @@ class Store:
             grouped={x['id']:[] for x in sales}
             for line in lines: grouped[line['sale_id']].append(line)
             for sale in sales: sale['lines']=grouped[sale['id']]
-            return {'customer':customer,'sales':sales,'total_credit':sum(x['original_debt'] for x in sales),'payments':sum(x['paid_amount'] for x in sales),'returns':sum(x['returned_amount'] for x in sales),'balance':sum(x['debt'] for x in sales)}
+            return {'customer':customer,'sales':sales,'total_sales':sum(x['total'] for x in sales),'initial_payments':sum(x['initial_paid'] for x in sales),'total_credit':sum(x['original_debt'] for x in sales),'payments':sum(x['paid_amount'] for x in sales),'returns':sum(x['returned_amount'] for x in sales),'balance':sum(x['debt'] for x in sales)}
     def history(self,u,b,start,end):
         start=iso(start); end=iso(end); require(start<=end,'Rango de fechas inválido')
         with self.connect() as db:
             sales=self.rows(db,"SELECT s.*,s.total+COALESCE(s.dairy_total,0) receipt_total,c.name customer,c.phone customer_phone,c.document customer_document,c.email customer_email,u.name operator,COALESCE((SELECT GROUP_CONCAT(method||': '||printf('%.2f',amount/100.0),' · ') FROM (SELECT method,SUM(amount) amount FROM (SELECT method,amount FROM payments WHERE sale_id=s.id AND amount>0 UNION ALL SELECT method,amount FROM dairy_payments WHERE sale_id=s.id AND amount>0) GROUP BY method)),'Fiado') payment_methods FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.user_id WHERE s.business_id=? AND (s.total>0 OR COALESCE(s.dairy_total,0)>0) AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY s.id DESC",(b,start,end))
-            debts=self.rows(db,"SELECT s.*,c.name customer,c.phone,c.document FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.debt>0 AND s.status='active' ORDER BY s.due,s.id",(b,))
+            debts=self.rows(db,"SELECT s.*,COALESCE(r.balance,s.debt) debt,c.name customer,c.phone,c.document FROM sales s LEFT JOIN receivables r ON r.sale_id=s.id JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND COALESCE(r.balance,s.debt)>0 AND COALESCE(r.status,'Pendiente')!='Anulado' AND s.status='active' ORDER BY s.due,s.id",(b,))
             if u['role']!='admin':
                 for s in sales+debts: s.pop('cost',None)
             result={'sales':sales,'debts':debts,'credit_sales':self.rows(db,"SELECT s.id,s.number,s.created,s.customer_id,c.name customer,s.original_debt,s.debt,s.status FROM sales s JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND s.original_debt>0 AND s.status='active' AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY s.created DESC,s.id DESC",(b,start,end)),'collections':self.rows(db,"SELECT x.*,c.name customer,c.document,u.name operator FROM collections x JOIN customers c ON c.id=x.customer_id JOIN users u ON u.id=x.user_id WHERE x.business_id=? AND date(x.created,'-5 hours') BETWEEN ? AND ? ORDER BY x.id DESC",(b,start,end)),'receivable_moves':self.rows(db,'SELECT m.*,c.name customer FROM receivable_moves m JOIN customers c ON c.id=m.customer_id WHERE m.business_id=? ORDER BY m.id DESC LIMIT 500',(b,)),'quotes':self.rows(db,'SELECT q.id,q.created,q.valid_until,q.total,q.converted_sale,c.name customer,c.phone customer_phone,c.email customer_email FROM quotes q LEFT JOIN customers c ON c.id=q.customer_id WHERE q.business_id=? ORDER BY q.id DESC',(b,)), 'cash_sessions':self.rows(db,'SELECT * FROM cash_sessions WHERE business_id=? ORDER BY id DESC LIMIT 200',(b,)), 'emails':self.rows(db,'SELECT * FROM document_emails WHERE business_id=? ORDER BY id DESC LIMIT 100',(b,)), 'purchases':self.rows(db,'SELECT p.*,u.name operator FROM purchases p JOIN users u ON u.id=p.user_id WHERE p.business_id=? ORDER BY p.id DESC',(b,)), 'purchase_lines':self.rows(db,'SELECT pl.*,p.name,p.unit,pu.number purchase_number,pu.supplier,pu.status purchase_status FROM purchase_lines pl JOIN products p ON p.id=pl.product_id JOIN purchases pu ON pu.id=pl.purchase_id WHERE pu.business_id=? ORDER BY pl.id DESC',(b,)), 'purchase_returns':self.rows(db,'SELECT r.*,u.name operator FROM purchase_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,)), 'sale_lines':self.rows(db,"SELECT l.*,p.category,s.number sale_number,s.status sale_status,c.name customer FROM sale_lines l JOIN sales s ON s.id=l.sale_id JOIN products p ON p.id=l.product_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.business_id=? AND date(s.created,'-5 hours') BETWEEN ? AND ? ORDER BY l.id DESC",(b,start,end)), 'sales_returns':self.rows(db,'SELECT r.*,u.name operator FROM sales_returns r JOIN users u ON u.id=r.user_id WHERE r.business_id=? ORDER BY r.id DESC',(b,))}

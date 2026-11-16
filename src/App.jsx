@@ -486,8 +486,25 @@ export default function App() {
       return;
     }
     if (type === "customer_payment") {
-      const allocations=Object.entries(d).filter(([key,value])=>key.startsWith("invoice_")&&Number(value)>0).map(([key,value])=>({sale_id:Number(key.slice(8)),amount:Number(value)}));
-      payload={customer_id:Number(d.customer_id),amount:allocations.length?allocations.reduce((sum,item)=>sum+item.amount,0):Number(d.amount),method:d.method,reference:d.reference,allocations,request_id:modal.requestId};
+      const payAll = d.payment_scope === "all";
+      const allocations = payAll
+        ? []
+        : Object.entries(d)
+            .filter(([key, value]) => key.startsWith("invoice_") && Number(value) > 0)
+            .map(([key, value]) => ({ sale_id: Number(key.slice(8)), amount: Number(value) }));
+      payload = {
+        customer_id: Number(d.customer_id),
+        pay_all: payAll,
+        amount: payAll
+          ? 0
+          : allocations.length
+            ? allocations.reduce((sum, item) => sum + item.amount, 0)
+            : Number(d.amount),
+        method: d.method,
+        reference: d.reference,
+        allocations,
+        request_id: modal.requestId,
+      };
     }
     if (type === "cash_nequi_review") payload = { ...d, amount: d.decision === "adjust" ? Number(d.amount || 0) : 0, reason: d.decision === "adjust" ? d.reason : "", request_id: modal.requestId };
     if (type === "waste") payload.lot_id = id;
@@ -753,13 +770,13 @@ export default function App() {
           const customer = state.customers.find((item) => Number(item.id) === Number(id));
           let statement;
           try { statement = await api(business, `/api/customer-statement?id=${id}`); }
-          catch { statement = { customer, sales: [], total_credit: 0, payments: 0, returns: 0, balance: 0 }; }
+          catch { statement = { customer, sales: [], total_sales: 0, initial_payments: 0, total_credit: 0, payments: 0, returns: 0, balance: 0 }; }
           for (const pending of pendingSales().filter((item) => item.business === business && item.action === "sale" && Number(item.data?.data?.customer_id) === Number(id))) {
             if (statement.sales?.some((sale) => sale.request_id === pending.requestId || String(sale.id) === String(pending.requestId))) continue;
             const data=pending.data.data,meta=data._offline||{},total=Number(meta.total||0),paid=(data.payments||[]).reduce((sum,payment)=>sum+Math.round(Number(payment.amount||0)*100),0),debt=Math.max(0,total-paid);
             if (!debt) continue;
-            statement.sales.push({id:pending.requestId,request_id:pending.requestId,number:"LOCAL",created:pending.created,original_debt:debt,debt,paid_amount:0,returned_amount:0,lines:meta.items||[]});
-            statement.total_credit+=debt;statement.balance+=debt;
+            statement.sales.push({id:pending.requestId,request_id:pending.requestId,number:"LOCAL",created:pending.created,total,original_debt:debt,initial_paid:Math.max(0,total-debt),debt,paid_amount:0,returned_amount:0,lines:meta.items||[]});
+            statement.total_sales=(statement.total_sales||0)+total;statement.initial_payments=(statement.initial_payments||0)+Math.max(0,total-debt);statement.total_credit+=debt;statement.balance+=debt;
           }
           const businessName = state.businesses.find((item) => item.id === business)?.name || "Comercio Local";
           setModal({ type: "account_statement", businessName, statement, key: uid() });

@@ -42,6 +42,7 @@ export default function OperationForm({
   );
   const [receiveSearch, setReceiveSearch] = useState("");
   const [cashDecision, setCashDecision] = useState(config.forceAdjustment ? "adjust" : "");
+  const [customerPaymentScope, setCustomerPaymentScope] = useState("all");
   const returnLines = config.sale?.lines ||
     (safeHistory.sale_lines || []).filter((line) => Number(line.sale_id) === Number(id));
   const [selectedSaleLine, setSelectedSaleLine] = useState(returnLines[0]?.id || "");
@@ -547,7 +548,63 @@ export default function OperationForm({
     case "customer_payment":
       title = "Pagar saldo del cliente";
       submit = "Registrar pago";
-      {const invoices=(safeHistory.debts||[]).filter(debt=>Number(debt.customer_id)===Number(config.id));body = <><Notice info>Puede pagar el saldo total o una parte. Si no distribuye valores por factura, el pago se aplica primero a las más antiguas.</Notice><input type="hidden" name="customer_id" value={config.id}/><MoneyField name="amount" label="Valor total recibido" defaultValue={(customer.balance || 0) / 100} max={(customer.balance || 0) / 100}/><div className="invoice-allocation-list"><b>Aplicar a facturas específicas (opcional)</b>{invoices.map(invoice=><MoneyField key={invoice.id} name={`invoice_${invoice.id}`} label={`${saleNumber(invoice,business)} · saldo ${cop(invoice.debt)}`} defaultValue="" max={invoice.debt/100} required={false}/>)}</div><Select name="method" label="Medio de pago">{methods.map(method=><option key={method}>{method}</option>)}</Select><Field name="reference" label="Referencia u observación"/></>;}
+      {
+        const invoices = (safeHistory.debts || []).filter(
+          (debt) => Number(debt.customer_id) === Number(config.id),
+        );
+        body = (
+          <>
+            <Notice info>
+              Saldo pendiente actual: <b>{cop(customer.balance || 0)}</b>. Al pagar
+              todo, el servidor vuelve a calcular las facturas pendientes y deja la
+              cuenta en cero.
+            </Notice>
+            <input type="hidden" name="customer_id" value={config.id} />
+            <Select
+              name="payment_scope"
+              label="Tipo de pago"
+              value={customerPaymentScope}
+              onChange={(event) => setCustomerPaymentScope(event.target.value)}
+            >
+              <option value="all">Pagar todo el saldo</option>
+              <option value="partial">Realizar un abono parcial</option>
+            </Select>
+            {customerPaymentScope === "partial" && (
+              <>
+                <MoneyField
+                  name="amount"
+                  label="Valor total recibido"
+                  defaultValue=""
+                  max={(customer.balance || 0) / 100}
+                />
+                <div className="invoice-allocation-list">
+                  <b>Aplicar a facturas específicas (opcional)</b>
+                  <p className="muted">
+                    Si no distribuye valores, el abono se aplica primero a las
+                    facturas más antiguas.
+                  </p>
+                  {invoices.map((invoice) => (
+                    <MoneyField
+                      key={invoice.id}
+                      name={`invoice_${invoice.id}`}
+                      label={`${saleNumber(invoice, business)} · saldo ${cop(invoice.debt)}`}
+                      defaultValue=""
+                      max={invoice.debt / 100}
+                      required={false}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
+            <Select name="method" label="Medio de pago">
+              {methods.map((method) => (
+                <option key={method}>{method}</option>
+              ))}
+            </Select>
+            <Field name="reference" label="Referencia u observación" />
+          </>
+        );
+      }
       break;
     case "quote":
       title = "Guardar cotización";

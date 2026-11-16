@@ -209,6 +209,7 @@ test('D1 repara una venta fiada antigua sin receivable antes de cobrar',async()=
     CREATE TABLE customers(id INTEGER PRIMARY KEY,business_id INTEGER,name TEXT); INSERT INTO customers VALUES(4,1,'Cliente legado');
     CREATE TABLE sales(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,debt INTEGER,original_debt INTEGER,status TEXT,created TEXT,user_id INTEGER);
     INSERT INTO sales VALUES(8,1,4,1000000,1000000,'active','2026-11-03T10:00:00Z',3);
+    INSERT INTO sales VALUES(9,1,4,250000,250000,'active','2026-11-04T10:00:00Z',3);
     CREATE TABLE receivables(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,sale_id INTEGER,created TEXT,original_amount INTEGER,paid_amount INTEGER,returned_amount INTEGER,balance INTEGER,status TEXT);
     CREATE TABLE collections(id INTEGER PRIMARY KEY,business_id INTEGER,customer_id INTEGER,cash_id INTEGER,user_id INTEGER,created TEXT,amount INTEGER,method TEXT,reference TEXT,request_id TEXT);
     CREATE TABLE collection_allocations(id INTEGER PRIMARY KEY,collection_id INTEGER,receivable_id INTEGER,sale_id INTEGER,amount INTEGER,balance_after INTEGER);
@@ -220,6 +221,10 @@ test('D1 repara una venta fiada antigua sin receivable antes de cobrar',async()=
   assert.ok(result.id);
   assert.deepEqual({...db.db.prepare('SELECT original_amount,paid_amount,balance,status FROM receivables WHERE sale_id=8').get()},{original_amount:1000000,paid_amount:400000,balance:600000,status:'Parcialmente pagado'});
   assert.equal(db.db.prepare('SELECT debt FROM sales WHERE id=8').get().debt,600000);
+  const paid=await storeCommand(db,{id:3,role:'admin'},1,'customer_payment',{customer_id:4,amount:0,pay_all:true,method:'Efectivo',request_id:'full-payment-123456'});
+  assert.deepEqual({amount:paid.amount,balance:paid.balance,allocations:paid.allocations},{amount:850000,balance:0,allocations:2});
+  assert.deepEqual(db.db.prepare('SELECT debt FROM sales ORDER BY id').all().map(row=>row.debt),[0,0]);
+  assert.deepEqual(db.db.prepare('SELECT balance,status FROM receivables ORDER BY sale_id').all().map(row=>({...row})),[{balance:0,status:'Pagado'},{balance:0,status:'Pagado'}]);
 });
 
 test('D1 guarda En reparto, Entregado y la reapertura del despacho',async()=>{
@@ -275,8 +280,8 @@ test('D1 excluye del estado de cuenta las facturas completamente pagadas',async(
   db.db.exec(`
     CREATE TABLE customers(id INTEGER PRIMARY KEY,business_id INTEGER,name TEXT,document TEXT);
     INSERT INTO customers VALUES(1,1,'Cliente','123');
-    CREATE TABLE sales(id INTEGER PRIMARY KEY,business_id INTEGER,number INTEGER,created TEXT,total INTEGER,original_debt INTEGER,debt INTEGER,due TEXT,status TEXT,customer_id INTEGER);
-    INSERT INTO sales VALUES(10,1,10,'2026-11-01T12:00:00Z',500000,500000,0,'2026-11-15','active',1),(11,1,11,'2026-11-09T12:00:00Z',800000,800000,300000,'2026-11-20','active',1);
+    CREATE TABLE sales(id INTEGER PRIMARY KEY,business_id INTEGER,number INTEGER,created TEXT,total INTEGER,dairy_total INTEGER,original_debt INTEGER,debt INTEGER,due TEXT,status TEXT,customer_id INTEGER);
+    INSERT INTO sales VALUES(10,1,10,'2026-11-01T12:00:00Z',500000,0,500000,0,'2026-11-15','active',1),(11,1,11,'2026-11-09T12:00:00Z',1000000,0,800000,300000,'2026-11-20','active',1);
     CREATE TABLE receivables(id INTEGER PRIMARY KEY,sale_id INTEGER,balance INTEGER,paid_amount INTEGER,returned_amount INTEGER,status TEXT);
     INSERT INTO receivables VALUES(1,10,0,500000,0,'Pagado'),(2,11,300000,500000,0,'Parcialmente pagado');
     CREATE TABLE sale_lines(id INTEGER PRIMARY KEY,sale_id INTEGER,name TEXT,unit TEXT,qty INTEGER,price INTEGER,total INTEGER,price_basis INTEGER);
@@ -287,6 +292,7 @@ test('D1 excluye del estado de cuenta las facturas completamente pagadas',async(
   `);
   const statement=await customerStatement(db,{id:1,role:'admin'},1,1);
   assert.deepEqual(statement.sales.map(sale=>sale.id),[11]);
+  assert.equal(statement.total_sales,1000000);assert.equal(statement.initial_payments,200000);
   assert.equal(statement.payments,500000);assert.equal(statement.balance,300000);
 });
 

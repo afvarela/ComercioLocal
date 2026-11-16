@@ -351,6 +351,23 @@ class CommerceTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT debt FROM sales WHERE id=?',(second['id'],)).fetchone()[0],0)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM collections WHERE request_id=?',(request,)).fetchone()[0],1)
 
+    def test_customer_payment_pay_all_uses_live_balance_and_clears_every_invoice(self):
+        p=self.product();self.lot(p,5);c=self.run_cmd('customer',{'name':'Cliente pago total','credit_limit':0})['id']
+        first=self.sale(p,1,0,customer_id=c,allow_credit=True,due=today())
+        second=self.sale(p,1,0,customer_id=c,allow_credit=True,due=today())
+        payment=self.run_cmd('customer_payment',{'customer_id':c,'amount':0,'pay_all':True,'method':'Nequi','request_id':uuid.uuid4().hex})
+        self.assertEqual((payment['amount'],payment['balance'],payment['allocations']),(1000000,0,2))
+        with self.store.connect() as db:
+            debts=[row[0] for row in db.execute('SELECT debt FROM sales WHERE id IN (?,?) ORDER BY id',(first['id'],second['id']))]
+            receivables=[tuple(row) for row in db.execute('SELECT balance,status FROM receivables WHERE sale_id IN (?,?) ORDER BY sale_id',(first['id'],second['id']))]
+            allocations=[row[0] for row in db.execute('SELECT amount FROM collection_allocations WHERE collection_id=? ORDER BY sale_id',(payment['id'],))]
+        self.assertEqual(debts,[0,0])
+        self.assertEqual(receivables,[(0,'Pagado'),(0,'Pagado')])
+        self.assertEqual(allocations,[500000,500000])
+        self.assertEqual(self.store.state(self.u,1)['customers'][0]['balance'],0)
+        self.assertEqual(self.store.history(self.u,1,today(),today())['debts'],[])
+        self.assertEqual(self.store.customer_statement(self.u,1,c)['balance'],0)
+
     def test_history_assigns_utc_sale_to_the_colombia_calendar_day(self):
         p=self.product();self.lot(p);sale=self.sale(p)
         with self.store.connect() as db:
@@ -478,6 +495,14 @@ class CommerceTests(unittest.TestCase):
         self.assertEqual((statement['total_credit'],statement['payments'],statement['balance']),(1200000,500000,700000))
         self.assertEqual(statement['sales'][0]['lines'][0]['name'],'Avena de fresa')
         self.assertEqual(statement['sales'][0]['lines'][0]['qty'],2)
+
+    def test_customer_statement_separates_initial_payment_from_credit_balance(self):
+        product=self.product('Compra real parcial',price=22900);self.lot(product,1)
+        customer=self.run_cmd('customer',{'name':'Fabio Sarmiento','credit_limit':0})['id']
+        self.sale(product,1,5000,customer_id=customer,allow_credit=True,due=today())
+        statement=self.store.customer_statement(self.u,1,customer);sale=statement['sales'][0]
+        self.assertEqual((sale['total'],sale['initial_paid'],sale['paid_amount'],sale['debt']),(2290000,500000,0,1790000))
+        self.assertEqual((statement['total_sales'],statement['initial_payments'],statement['payments'],statement['balance']),(2290000,500000,0,1790000))
 
     def test_paid_credit_disappears_and_new_credit_starts_clean_statement(self):
         p=self.product('Producto fiado',price=6000);self.lot(p,3);customer=self.run_cmd('customer',{'name':'Cliente cuenta nueva','credit_limit':0})['id']
